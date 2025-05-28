@@ -680,6 +680,10 @@ class EmeraldKillfeedBot(commands.Bot):
         # Clean up SFTP connections
         await self.cleanup_connections()
 
+        # Shutdown log parser to save state
+        if hasattr(self, 'log_parser') and self.log_parser:
+            await self.log_parser.shutdown()
+
         if self.scheduler.running:
             self.scheduler.shutdown()
             logger.info("Scheduler stopped")
@@ -697,7 +701,7 @@ async def main():
     bot_token = os.getenv('BOT_TOKEN') or os.getenv('DISCORD_TOKEN')
     mongo_uri = os.getenv('MONGO_URI') or os.getenv('MONGODB_URI')
     tip4serv_key = os.getenv('TIP4SERV_KEY')  # Optional service key
-    
+
     # Railway environment detection
     railway_env = os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('RAILWAY_STATIC_URL')
     if railway_env:
@@ -713,7 +717,7 @@ async def main():
         logger.error("❌ MONGO_URI not found in environment variables") 
         logger.error("Please set MONGO_URI in your Railway environment variables")
         return
-    
+
     # Log startup success
     logger.info(f"✅ Bot starting with token: {'*' * 20}...{bot_token[-4:] if bot_token else 'MISSING'}")
     logger.info(f"✅ MongoDB URI configured: {'*' * 20}...{mongo_uri[-10:] if mongo_uri else 'MISSING'}")

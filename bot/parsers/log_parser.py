@@ -4,6 +4,7 @@ Parses Deadside.log files for server events (PREMIUM ONLY)
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -40,8 +41,15 @@ class LogParser:
         self.log_file_hashes: Dict[str, str] = {}  # Track log file rotation
         self.player_lifecycle: Dict[str, Dict[str, Any]] = {}  # Track comprehensive player lifecycle
         
+        # PERSISTENT FILE TRACKING - Track file state across restarts
+        self.file_state_path = Path('./log_parser_state.json')
+        self.file_states: Dict[str, Dict[str, Any]] = {}  # Track file size, position, and last line
+        
         # PLAYER CONNECTION LIFECYCLE TRACKING - Initialize new system
         self.connection_parser = ConnectionLifecycleParser(bot)
+        
+        # Load persistent state on startup
+        asyncio.create_task(self._load_persistent_state())
 
     def _compile_log_patterns(self) -> Dict[str, re.Pattern]:
         """Compile robust regex patterns for complete player connection lifecycle tracking"""
@@ -673,36 +681,40 @@ class LogParser:
 
                         server_key = f"{sftp_host}_{server_id}"
 
-                        # Detect log rotation by checking if file size decreased
-                        if server_key in self.last_log_position:
-                            if file_size is not None and file_size < self.last_log_position[server_key]:
-                                logger.info(f"Log rotation detected for {server_key}")
-                                self.last_log_position[server_key] = 0  # Reset position
-
-                        # Read from last position
-                        start_position = self.last_log_position.get(server_key, 0)
-
                         async with sftp.open(remote_path, 'r') as f:
                             # Read entire file content
                             full_content = await f.read()
 
-                            # Split into lines to track by line count instead of byte position
+                            # Split into lines for processing
                             all_lines = full_content.splitlines()
                             total_lines = len(all_lines)
 
-                            # Get last processed line count
-                            last_line_count = self.last_log_position.get(server_key, 0)
-
-                            # Detect rotation if line count decreased significantly
-                            if last_line_count > total_lines and total_lines > 0:
-                                logger.info(f"Log rotation detected for {server_key} (line count: {last_line_count} -> {total_lines})")
+                            # Check if file has been reset using persistent tracking
+                            file_was_reset = self._detect_file_reset(server_key, file_size, all_lines)
+                            
+                            if file_was_reset:
+                                logger.info(f"File reset detected for {server_key}, starting from beginning")
                                 last_line_count = 0
+                            else:
+                                # Get last processed line count from persistent state
+                                stored_state = self.file_states.get(server_key, {})
+                                last_line_count = stored_state.get('line_count', 0)
+                                
+                                # Validate that our stored position is still valid
+                                if last_line_count > total_lines:
+                                    logger.warning(f"Stored position {last_line_count} exceeds file size {total_lines}, resetting")
+                                    last_line_count = 0
 
                             # Get new lines only
                             new_lines = all_lines[last_line_count:]
                             new_content = '\n'.join(new_lines)
 
-                            # Update position to current line count
+                            # Update file state with current information
+                            if all_lines:
+                                last_line_content = all_lines[-1] if all_lines else ""
+                                await self._update_file_state(server_key, file_size, total_lines, last_line_content)
+
+                            # Update legacy position tracking for compatibility
                             self.last_log_position[server_key] = total_lines
 
                             logger.info(f"Successfully read log file from: {remote_path} ({len(new_lines)} new lines from total {total_lines})")
@@ -1353,18 +1365,35 @@ class LogParser:
                 return
 
             lines = log_content.splitlines()
+            total_lines = len(lines)
 
-            # Track position for incremental parsing
+            # Track position for incremental parsing using persistent state
             server_key = f"{guild_id}_{server_id}"
-            last_position = self.last_log_position.get(server_key, 0)
+            
+            # Check if file has been reset using persistent tracking
+            file_size = len(log_content.encode('utf-8'))  # Estimate file size
+            file_was_reset = self._detect_file_reset(server_key, file_size, lines)
+            
+            if file_was_reset:
+                logger.info(f"Dev file reset detected for {server_key}, starting from beginning")
+                last_position = 0
+            else:
+                # Get last processed line count from persistent state
+                stored_state = self.file_states.get(server_key, {})
+                last_position = stored_state.get('line_count', 0)
+                
+                # Validate that our stored position is still valid
+                if last_position > total_lines:
+                    logger.warning(f"Stored position {last_position} exceeds file size {total_lines}, resetting")
+                    last_position = 0
 
             # Process new lines only
             new_lines = lines[last_position:]
             new_events = 0
 
             for line in new_lines:
-                server_key = self.get_server_status_key(guild_id, server_id)
-                event_data = await self.parse_log_line(line, server_key, guild_id)
+                status_server_key = self.get_server_status_key(guild_id, server_id)
+                event_data = await self.parse_log_line(line, status_server_key, guild_id)
                 if event_data:
                     # Process player tracking events
                     await self.process_log_event(guild_id, server_id, event_data)
@@ -1372,8 +1401,13 @@ class LogParser:
                     await self.send_log_event_embed(guild_id, server_id, event_data)
                     new_events += 1
 
-            # Update position
-            self.last_log_position[server_key] = len(lines)
+            # Update file state with current information
+            if lines:
+                last_line_content = lines[-1] if lines else ""
+                await self._update_file_state(server_key, file_size, total_lines, last_line_content)
+
+            # Update legacy position tracking for compatibility
+            self.last_log_position[server_key] = total_lines
 
             if new_events > 0:
                 logger.info(f"Processed {new_events} new dev log events for server {server_id}")
@@ -1543,6 +1577,71 @@ class LogParser:
         except Exception as e:
             logger.error(f"Failed to process log event: {e}")
 
+    async def _load_persistent_state(self):
+        """Load persistent file state from disk"""
+        try:
+            if self.file_state_path.exists():
+                async with aiofiles.open(self.file_state_path, 'r') as f:
+                    content = await f.read()
+                    self.file_states = json.loads(content) if content.strip() else {}
+                    logger.info(f"Loaded persistent state for {len(self.file_states)} servers")
+            else:
+                self.file_states = {}
+                logger.info("No persistent state file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Failed to load persistent state: {e}")
+            self.file_states = {}
+
+    async def _save_persistent_state(self):
+        """Save persistent file state to disk"""
+        try:
+            async with aiofiles.open(self.file_state_path, 'w') as f:
+                await f.write(json.dumps(self.file_states, indent=2))
+            logger.debug("Saved persistent state to disk")
+        except Exception as e:
+            logger.error(f"Failed to save persistent state: {e}")
+
+    async def _update_file_state(self, server_key: str, file_size: int, line_count: int, last_line_content: str):
+        """Update file state tracking"""
+        self.file_states[server_key] = {
+            'file_size': file_size,
+            'line_count': line_count,
+            'last_line': last_line_content,
+            'last_updated': datetime.now(timezone.utc).isoformat()
+        }
+        # Save state periodically (every 10 updates to avoid excessive I/O)
+        if len(self.file_states) % 10 == 0:
+            await self._save_persistent_state()
+
+    def _detect_file_reset(self, server_key: str, current_size: int, current_lines: List[str]) -> bool:
+        """Detect if file has been reset/rotated based on size and content"""
+        if server_key not in self.file_states:
+            return False
+            
+        stored_state = self.file_states[server_key]
+        stored_size = stored_state.get('file_size', 0)
+        stored_line_count = stored_state.get('line_count', 0)
+        stored_last_line = stored_state.get('last_line', '')
+        
+        # If file is significantly smaller, it's likely been reset
+        if current_size < stored_size * 0.5:  # 50% smaller indicates rotation
+            logger.info(f"File reset detected for {server_key}: size {stored_size} -> {current_size}")
+            return True
+            
+        # If we have fewer lines than expected, it's been reset
+        current_line_count = len(current_lines)
+        if current_line_count < stored_line_count * 0.5:  # 50% fewer lines
+            logger.info(f"File reset detected for {server_key}: lines {stored_line_count} -> {current_line_count}")
+            return True
+            
+        # If the last line we remember isn't in the current file, it's been reset
+        if stored_last_line and current_lines:
+            if stored_last_line not in current_lines[-min(10, len(current_lines)):]:  # Check last 10 lines
+                logger.info(f"File reset detected for {server_key}: last line not found")
+                return True
+                
+        return False
+
     def reset_log_positions(self, guild_id: int = None, server_id: str = None):
         """Reset log position tracking for specific server or all servers"""
         if guild_id and server_id:
@@ -1550,13 +1649,17 @@ class LogParser:
             server_key = f"{guild_id}_{server_id}"
             if server_key in self.last_log_position:
                 del self.last_log_position[server_key]
-                logger.info(f"Reset log position for server {server_id} in guild {guild_id}")
-            else:
-                logger.info(f"No position tracking found for server {server_id} in guild {guild_id}")
+            if server_key in self.file_states:
+                del self.file_states[server_key]
+            logger.info(f"Reset log position and file state for server {server_id} in guild {guild_id}")
         else:
             # Reset all positions
             self.last_log_position.clear()
-            logger.info("Reset all log position tracking")
+            self.file_states.clear()
+            logger.info("Reset all log position tracking and file states")
+        
+        # Save state after reset
+        asyncio.create_task(self._save_persistent_state())
 
     async def run_log_parser(self):
         """Main log parser execution with enhanced event detection"""
@@ -1595,9 +1698,26 @@ class LogParser:
                         import traceback
                         logger.error(f"Server error traceback: {traceback.format_exc()}")
 
+            # Save persistent state after processing all servers
+            await self._save_persistent_state()
+            
             logger.info(f"Enhanced log parser execution completed - processed {total_servers_processed} servers")
 
         except Exception as e:
             logger.error(f"Enhanced log parser execution failed: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
+        finally:
+            # Ensure state is saved even if there's an error
+            try:
+                await self._save_persistent_state()
+            except Exception as save_error:
+                logger.error(f"Failed to save state during cleanup: {save_error}")
+
+    async def shutdown(self):
+        """Graceful shutdown - save persistent state"""
+        try:
+            await self._save_persistent_state()
+            logger.info("Log parser shutdown complete - state saved")
+        except Exception as e:
+            logger.error(f"Error during log parser shutdown: {e}")
