@@ -1,1 +1,0 @@
-# Emerald's Killfeed - Parsers

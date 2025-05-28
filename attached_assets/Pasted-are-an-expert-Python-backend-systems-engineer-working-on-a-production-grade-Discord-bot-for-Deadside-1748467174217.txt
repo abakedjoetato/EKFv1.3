@@ -1,0 +1,121 @@
+are an expert Python backend systems engineer working on a production-grade Discord bot for Deadside server log parsing.
+
+You have been given a complex module named `log_parser.py`, responsible for:
+- Fetching logs over SFTP
+- Parsing thousands of lines per file
+- Tracking player events and missions
+- Writing parsed events to a database
+- Optionally dispatching Discord embeds
+
+The system already supports:
+- Persistent line tracking via `log_parser_state.json`
+- Regex-based pattern extraction
+- Batch processing of 500 lines per cycle
+- Discord and DB integration
+
+However, **initial parse performance is suboptimal**, especially:
+- On new servers with large logs
+- After bot restarts (cold starts)
+- When resuming without a checkpoint
+
+---
+
+### 🔧 OBJECTIVES (Performance & Scalability Enhancements)
+
+Please modify `log_parser.py` with the following changes:
+
+---
+
+#### 1. **FAST PARSE MODE (Cold Start Optimization)**
+- Add a toggleable `fast_parse` mode to the `LogParser` class.
+- When enabled:
+  - Skip `send_log_event_embed(...)`
+  - **Do not skip** DB writes or `process_log_event(...)`
+
+Purpose: drastically reduce first-time parse delays by eliminating Discord API waits.
+
+---
+
+#### 2. **ASYNC BATCH PARSING WITH `asyncio.gather()`**
+- In `parse_server_logs()` and `parse_dev_logs()`, change the per-line parse loop into batched concurrent calls:
+```python
+results = await asyncio.gather(*[
+    self.parse_log_line(line, server_key, guild_id) for line in batch
+], return_exceptions=True)
+
+For each result, if valid, continue to:
+
+Call process_log_event(...)
+
+Conditionally call send_log_event_embed(...) only if not self.fast_parse
+
+
+
+
+---
+
+3. DISPATCH SEMAPHORE FOR CONCURRENCY CONTROL
+
+Add self.parse_semaphore = asyncio.BoundedSemaphore(10) to __init__
+
+Wrap all server parse tasks like so:
+
+
+async with self.parse_semaphore:
+    await self.parse_logs_for_server(...)
+
+Purpose: control concurrency and allow scaling to 100+ servers safely.
+
+
+---
+
+4. (Optional) EMBED BACKLOG BUFFER
+
+Add self.embed_backlog: List[Tuple[int, str, Dict[str, Any]]] = []
+
+If fast_parse is active:
+
+Queue the event like: self.embed_backlog.append((guild_id, server_id, event_data))
+
+
+After full parse completes, flush embeds:
+
+
+for args in self.embed_backlog:
+    await self.send_log_event_embed(*args)
+self.embed_backlog.clear()
+
+
+---
+
+🛡️ NON-NEGOTIABLE CONSTRAINTS
+
+All database writes must remain active
+
+Preserve log_parser_state.json file logic
+
+Retain compatibility with all existing methods (no breaking API changes)
+
+Ensure compatibility with Discord embed factory
+
+
+
+---
+
+📦 FINAL DELIVERABLE
+
+Provide a refactored log_parser.py that:
+
+Implements the above systems
+
+Is production-safe
+
+Improves first-pass performance on large files
+
+Maintains database integrity
+
+
+
+---
+
+You are allowed to restructure function internals, inject new helper methods, or extend the class with initialization flags as needed.
