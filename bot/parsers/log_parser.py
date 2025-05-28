@@ -165,7 +165,7 @@ class LogParser:
         return f"{guild_id}_{server_id}"
 
     async def get_sftp_connection(self, server_config: Dict[str, Any]) -> Optional[asyncssh.SSHClientConnection]:
-        """Get or create SFTP connection with connection pooling"""
+        """Get or create SFTP connection with enhanced compatibility for legacy SSH servers"""
         try:
             sftp_host = server_config.get('host')
             sftp_port = server_config.get('port', 22)
@@ -185,18 +185,90 @@ class LogParser:
                     # Connection is dead, remove it
                     del self.sftp_pool[pool_key]
 
-            # Create new connection
-            conn = await asyncssh.connect(
-                sftp_host,
-                port=sftp_port,
-                username=sftp_username,
-                password=sftp_password,
-                known_hosts=None
-            )
+            # Enhanced SSH connection options for maximum compatibility
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.debug(f"SFTP connection attempt {attempt}/{max_retries} to {sftp_host}:{sftp_port}")
+                    
+                    # Configure connection with comprehensive compatibility options
+                    connection_options = {
+                        'username': sftp_username,
+                        'password': sftp_password,
+                        'known_hosts': None,
+                        'client_keys': None,
+                        'preferred_auth': 'password,keyboard-interactive',
+                        # Comprehensive key exchange algorithms (including legacy)
+                        'kex_algs': [
+                            'diffie-hellman-group14-sha256',
+                            'diffie-hellman-group16-sha512',
+                            'diffie-hellman-group18-sha512',
+                            'diffie-hellman-group14-sha1',
+                            'diffie-hellman-group1-sha1',
+                            'diffie-hellman-group-exchange-sha256',
+                            'diffie-hellman-group-exchange-sha1',
+                            'ecdh-sha2-nistp256',
+                            'ecdh-sha2-nistp384',
+                            'ecdh-sha2-nistp521',
+                            'curve25519-sha256',
+                            'curve25519-sha256@libssh.org'
+                        ],
+                        # Comprehensive encryption algorithms
+                        'encryption_algs': [
+                            'aes256-ctr', 'aes192-ctr', 'aes128-ctr',
+                            'aes256-gcm@openssh.com', 'aes128-gcm@openssh.com',
+                            'aes256-cbc', 'aes192-cbc', 'aes128-cbc',
+                            '3des-cbc', 'blowfish-cbc',
+                            'arcfour256', 'arcfour128', 'arcfour'
+                        ],
+                        # Comprehensive MAC algorithms
+                        'mac_algs': [
+                            'hmac-sha2-256-etm@openssh.com',
+                            'hmac-sha2-512-etm@openssh.com',
+                            'hmac-sha2-256', 'hmac-sha2-512',
+                            'hmac-sha1-etm@openssh.com',
+                            'hmac-sha1', 'hmac-md5-etm@openssh.com',
+                            'hmac-md5', 'hmac-ripemd160-etm@openssh.com',
+                            'hmac-ripemd160'
+                        ],
+                        # Server host key algorithms
+                        'server_host_key_algs': [
+                            'rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa',
+                            'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384',
+                            'ecdsa-sha2-nistp521', 'ssh-ed25519',
+                            'ssh-dss'
+                        ]
+                    }
 
-            self.sftp_pool[pool_key] = conn
-            logger.debug(f"Created new SFTP connection to {sftp_host}:{sftp_port}")
-            return conn
+                    # Establish connection with timeout
+                    conn = await asyncio.wait_for(
+                        asyncssh.connect(sftp_host, port=sftp_port, **connection_options),
+                        timeout=30
+                    )
+
+                    self.sftp_pool[pool_key] = conn
+                    logger.info(f"Successfully created SFTP connection to {sftp_host}:{sftp_port}")
+                    return conn
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"SFTP connection timed out (attempt {attempt}/{max_retries})")
+                except asyncssh.DisconnectError as e:
+                    logger.warning(f"SFTP server disconnected: {e} (attempt {attempt}/{max_retries})")
+                except Exception as e:
+                    if 'auth' in str(e).lower():
+                        logger.error(f"SFTP authentication failed with provided credentials")
+                        return None
+                    else:
+                        logger.warning(f"SFTP connection error: {e} (attempt {attempt}/{max_retries})")
+
+                # Apply exponential backoff between retries
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    logger.debug(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+
+            logger.error(f"Failed to connect to SFTP server after {max_retries} attempts")
+            return None
 
         except Exception as e:
             logger.error(f"Failed to get SFTP connection: {e}")
