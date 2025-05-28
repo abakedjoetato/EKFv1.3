@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 import asyncssh
+import paramiko
+import io
 from motor.motor_asyncio import AsyncIOMotorClient
 
 logger = logging.getLogger(__name__)
@@ -178,6 +180,44 @@ class LogParser:
     def get_server_status_key(self, guild_id: int, server_id: str) -> str:
         """Generate unique key for server status tracking"""
         return f"{guild_id}_{server_id}"
+
+    async def get_sftp_connection_paramiko(self, server_config: Dict[str, Any]) -> Optional[paramiko.SFTPClient]:
+        """Get SFTP connection using Paramiko for legacy server compatibility"""
+        try:
+            sftp_host = server_config.get('host')
+            sftp_port = server_config.get('port', 22)
+            sftp_username = server_config.get('sftp_username')
+            sftp_password = server_config.get('sftp_password')
+
+            if not all([sftp_host, sftp_username, sftp_password]):
+                logger.error(f"Missing SFTP credentials for server {server_config.get('_id')}")
+                return None
+
+            # Create SSH client with legacy algorithm support
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # Connect with legacy algorithm support
+            ssh.connect(
+                hostname=sftp_host,
+                port=sftp_port,
+                username=sftp_username,
+                password=sftp_password,
+                timeout=30,
+                allow_agent=False,
+                look_for_keys=False,
+                # Enable legacy algorithms
+                disabled_algorithms={'pubkeys': [], 'kex': [], 'keys': [], 'ciphers': [], 'macs': []}
+            )
+            
+            # Create SFTP client
+            sftp = ssh.open_sftp()
+            logger.info(f"Successfully created Paramiko SFTP connection to {sftp_host}:{sftp_port}")
+            return sftp
+
+        except Exception as e:
+            logger.error(f"Failed to create Paramiko SFTP connection: {e}")
+            return None
 
     async def get_sftp_connection(self, server_config: Dict[str, Any]) -> Optional[asyncssh.SSHClientConnection]:
         """Get or create SFTP connection with enhanced compatibility for legacy SSH servers"""
@@ -500,10 +540,143 @@ class LogParser:
                     await self._save_persistent_state()
 
                 except Exception as e:
-                    logger.error(f"Error processing SFTP logs: {e}")
+                    logger.error(f"Error processing SFTP logs with AsyncSSH: {e}")
+                    # Try Paramiko fallback for legacy servers
+                    logger.info("Attempting SFTP connection with Paramiko for legacy compatibility...")
+                    await self.parse_sftp_logs_paramiko(guild_id, server_config)
 
         except Exception as e:
             logger.error(f"Error in SFTP log parsing: {e}")
+
+    async def parse_sftp_logs_paramiko(self, guild_id: int, server_config: Dict[str, Any]):
+        """Parse SFTP logs using Paramiko for legacy server compatibility"""
+        server_id = str(server_config.get('_id', 'unknown'))
+        server_key = self.get_server_status_key(guild_id, server_id)
+        
+        try:
+            # Get Paramiko SFTP connection
+            sftp = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.get_sftp_connection_paramiko_sync(server_config)
+            )
+            
+            if not sftp:
+                logger.warning(f"Failed to establish Paramiko SFTP connection for server {server_id}")
+                return
+
+            # Define remote log path
+            sftp_host = server_config.get('host')
+            remote_path = f"./{sftp_host}_{server_id}/actual1/logs/"
+            
+            try:
+                # List log files
+                log_files = []
+                try:
+                    files = sftp.listdir(remote_path)
+                    log_files = [f for f in files if f.endswith('.log')]
+                except Exception as e:
+                    logger.warning(f"Could not list files in {remote_path}: {e}")
+                    return
+
+                if not log_files:
+                    logger.warning(f"No log files found in {remote_path}")
+                    return
+
+                # Get the most recent log file
+                latest_log = max(log_files)
+                log_file_path = f"{remote_path}{latest_log}"
+                
+                # Get file stats
+                try:
+                    file_stat = sftp.stat(log_file_path)
+                    file_size = file_stat.st_size
+                except Exception as e:
+                    logger.warning(f"Could not get stats for {log_file_path}: {e}")
+                    return
+
+                # Check file state and position
+                file_state = self.file_states.get(server_key, {})
+                last_position = self.last_log_position.get(server_key, 0)
+                
+                # Read from last position
+                if last_position >= file_size:
+                    logger.debug(f"No new data in {log_file_path}")
+                    return
+
+                # Read new content
+                with sftp.open(log_file_path, 'r') as remote_file:
+                    remote_file.seek(last_position)
+                    new_content = remote_file.read()
+                    
+                    if new_content:
+                        lines = new_content.strip().splitlines()
+                        logger.info(f"Processing {len(lines)} new log lines from {log_file_path}")
+                        
+                        # Process each line
+                        for line in lines:
+                            if line.strip():
+                                result = await self.parse_log_line(line, server_key, guild_id)
+                                if result:
+                                    # Process the log event
+                                    await self.process_log_event(guild_id, result)
+                                    
+                                    # Handle embeds based on mode
+                                    if self.fast_parse:
+                                        self.embed_backlog.append((guild_id, server_id, result))
+                                    else:
+                                        if self.should_output_event(result['type'], result.get('data', {})):
+                                            await self.send_log_event_embed(guild_id, server_id, result)
+
+                        # Update position
+                        new_position = last_position + len(new_content.encode('utf-8'))
+                        self.last_log_position[server_key] = new_position
+                        await self._save_persistent_state()
+                        
+                        logger.info(f"Successfully processed Paramiko SFTP logs for server {server_id}")
+
+            finally:
+                # Close SFTP connection
+                sftp.close()
+                
+        except Exception as e:
+            logger.error(f"Error in Paramiko SFTP log parsing: {e}")
+
+    def get_sftp_connection_paramiko_sync(self, server_config: Dict[str, Any]) -> Optional[paramiko.SFTPClient]:
+        """Synchronous version of Paramiko SFTP connection for thread execution"""
+        try:
+            sftp_host = server_config.get('host')
+            sftp_port = server_config.get('port', 22)
+            sftp_username = server_config.get('sftp_username')
+            sftp_password = server_config.get('sftp_password')
+
+            if not all([sftp_host, sftp_username, sftp_password]):
+                logger.error(f"Missing SFTP credentials for server {server_config.get('_id')}")
+                return None
+
+            # Create SSH client with legacy algorithm support
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # Connect with legacy algorithm support
+            ssh.connect(
+                hostname=sftp_host,
+                port=sftp_port,
+                username=sftp_username,
+                password=sftp_password,
+                timeout=30,
+                allow_agent=False,
+                look_for_keys=False,
+                # Enable legacy algorithms
+                disabled_algorithms={'pubkeys': [], 'kex': [], 'keys': [], 'ciphers': [], 'macs': []}
+            )
+            
+            # Create SFTP client
+            sftp = ssh.open_sftp()
+            logger.info(f"Successfully created Paramiko SFTP connection to {sftp_host}:{sftp_port}")
+            return sftp
+
+        except Exception as e:
+            logger.error(f"Failed to create Paramiko SFTP connection: {e}")
+            return None
 
     async def parse_log_line(self, line: str, server_key: str, guild_id: int) -> Optional[Dict[str, Any]]:
         """Parse a single log line and extract event data"""
