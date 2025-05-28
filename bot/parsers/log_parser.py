@@ -156,9 +156,24 @@ class LogParser:
             logger.info("Log parser scheduled to run every 30 seconds")
 
     async def shutdown(self):
-        """Clean shutdown - save state"""
-        await self._save_persistent_state()
-        logger.info("Log parser shutdown - state saved")
+        """Clean shutdown - save state and close connections"""
+        try:
+            # Save persistent state
+            await self._save_persistent_state()
+            
+            # Close all SFTP connections
+            for pool_key, conn in list(self.sftp_pool.items()):
+                try:
+                    conn.close()
+                    logger.debug(f"Closed SFTP connection: {pool_key}")
+                except Exception as e:
+                    logger.warning(f"Error closing SFTP connection {pool_key}: {e}")
+            
+            self.sftp_pool.clear()
+            logger.info("Log parser shutdown complete - state saved and connections closed")
+            
+        except Exception as e:
+            logger.error(f"Error during log parser shutdown: {e}")
 
     def get_server_status_key(self, guild_id: int, server_id: str) -> str:
         """Generate unique key for server status tracking"""
@@ -178,11 +193,16 @@ class LogParser:
             if pool_key in self.sftp_pool:
                 conn = self.sftp_pool[pool_key]
                 try:
-                    # Test connection
-                    await conn.run('echo test', check=True)
+                    # Test connection with timeout
+                    await asyncio.wait_for(conn.run('echo test', check=True), timeout=5)
                     return conn
-                except:
+                except (asyncio.TimeoutError, Exception) as e:
                     # Connection is dead, remove it
+                    logger.debug(f"Removing dead SFTP connection: {e}")
+                    try:
+                        conn.close()
+                    except:
+                        pass
                     del self.sftp_pool[pool_key]
 
             # Enhanced SSH connection options for maximum compatibility
@@ -254,10 +274,20 @@ class LogParser:
                     logger.warning(f"SFTP connection timed out (attempt {attempt}/{max_retries})")
                 except asyncssh.DisconnectError as e:
                     logger.warning(f"SFTP server disconnected: {e} (attempt {attempt}/{max_retries})")
+                except (asyncssh.ProtocolError, asyncssh.KeyExchangeFailed) as e:
+                    logger.warning(f"SSH protocol/key exchange error: {e} (attempt {attempt}/{max_retries})")
+                except asyncssh.PermissionDenied as e:
+                    logger.error(f"SFTP authentication failed: {e}")
+                    return None  # Don't retry on auth failures
+                except ConnectionError as e:
+                    logger.warning(f"SFTP connection error: {e} (attempt {attempt}/{max_retries})")
                 except Exception as e:
-                    if 'auth' in str(e).lower():
-                        logger.error(f"SFTP authentication failed with provided credentials")
-                        return None
+                    error_str = str(e).lower()
+                    if any(term in error_str for term in ['auth', 'permission', 'denied', 'password']):
+                        logger.error(f"SFTP authentication failed: {e}")
+                        return None  # Don't retry on auth failures
+                    elif 'invalid dh' in error_str or 'diffie-hellman' in error_str:
+                        logger.warning(f"DH parameter error (attempt {attempt}/{max_retries}): {e}")
                     else:
                         logger.warning(f"SFTP connection error: {e} (attempt {attempt}/{max_retries})")
 

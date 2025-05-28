@@ -509,11 +509,12 @@ class EmeraldKillfeedBot(commands.Bot):
                 await self.killfeed_parser.cleanup_sftp_connections()
 
             if hasattr(self, 'log_parser') and self.log_parser:
-                # Clean up log parser SFTP connections
-                for pool_key, conn in list(self.log_parser.sftp_pool.items()):
-                    try:
-                        conn.close()
-                    except:
+                await self.log_parser.shutdown()
+
+            logger.info("All SSH connections cleaned up successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during connection cleanup: {e}")
                         pass
                 self.log_parser.sftp_pool.clear()
 
