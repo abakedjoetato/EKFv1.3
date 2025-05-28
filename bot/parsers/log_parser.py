@@ -343,9 +343,9 @@ class LogParser:
 
                     try:
                         async with sftp.open(latest_log, 'r') as f:
-                            await f.seek(last_position)
-                            content = await f.read()
-                            new_position = await f.tell()
+                            f.seek(last_position)
+                            content = f.read()
+                            new_position = f.tell()
                     except Exception as e:
                         logger.error(f"Error reading log file {latest_log}: {e}")
                         return
