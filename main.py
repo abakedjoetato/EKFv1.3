@@ -515,13 +515,6 @@ class EmeraldKillfeedBot(commands.Bot):
             
         except Exception as e:
             logger.error(f"Error during connection cleanup: {e}")
-                        pass
-                self.log_parser.sftp_pool.clear()
-
-            logger.info("Cleaned up all SFTP connections")
-
-        except Exception as e:
-            logger.error(f"Failed to cleanup connections: {e}")
 
     async def setup_database(self):
         """Setup MongoDB connection"""
