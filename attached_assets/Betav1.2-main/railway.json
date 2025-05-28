@@ -1,0 +1,11 @@
+{
+  "builds": [
+    {
+      "src": "requirements.txt",
+      "use": "@railway/builders-python"
+    }
+  ],
+  "deploy": {
+    "startCommand": "python3 main.py"
+  }
+}

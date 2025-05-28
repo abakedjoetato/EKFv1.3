@@ -18,4 +18,3 @@ paramiko
 py-cord
 pymongo
 python-dotenv
-asyncssh[bcrypt,libnacl]
