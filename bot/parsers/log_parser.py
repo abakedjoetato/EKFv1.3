@@ -1098,9 +1098,9 @@ class LogParser:
         if event_type in ['trader_spawn', 'trader_switched', 'trader_available']:
             return True
 
-        # Vehicle spawns - output on valid spawn/initiate line
+        # Vehicle spawns - disabled for now
         if event_type in ['vehicle_spawn', 'vehicle_delete']:
-            return True
+            return False
 
         # Player events - output based on significance (connections and disconnections)
         if event_type in ['player_world_connect', 'player_world_spawn', 'player_online_status', 'player_session_start',
