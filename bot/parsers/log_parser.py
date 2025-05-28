@@ -4,1097 +4,524 @@ Parses Deadside.log files for server events (PREMIUM ONLY)
 """
 
 import asyncio
-import json
 import logging
-import os
+import json
 import re
-import glob
+import os
 from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Set
-
-import aiofiles
-import discord
 import asyncssh
-from discord.ext import commands
-from .connection_parser import ConnectionLifecycleParser
+from motor.motor_asyncio import AsyncIOMotorClient
 
 logger = logging.getLogger(__name__)
 
 class LogParser:
     """
-    LOG PARSER (PREMIUM ONLY)
-    - Runs every 300 seconds
-    - SFTP path: ./{host}_{serverID}/Logs/Deadside.log
-    - Detects: Player joins/disconnects, Queue sizes, Airdrops, missions, traders, crashes
-    - Detects log rotation
-    - Sends styled embeds to respective channels
+    Enhanced Log Parser with Performance Optimizations
+    - Fast parse mode for cold starts
+    - Async batch processing with asyncio.gather()
+    - Concurrency control with semaphores
+    - Embed backlog buffering
     """
 
     def __init__(self, bot):
         self.bot = bot
-        self.last_log_position: Dict[str, int] = {}  # Track file position per server
-        self.log_patterns = self._compile_log_patterns()
-        self.player_sessions: Dict[str, Dict[str, Any]] = {}  # Track player join times for playtime rewards
-        self.server_status: Dict[str, Dict[str, Any]] = {}  # Track real-time server status per guild_server
-        self.sftp_pool: Dict[str, asyncssh.SSHClientConnection] = {}  # SFTP connection pool
-        self.log_file_hashes: Dict[str, str] = {}  # Track log file rotation
-        self.player_lifecycle: Dict[str, Dict[str, Any]] = {}  # Track comprehensive player lifecycle
-        
-        # PERSISTENT FILE TRACKING - Track file state across restarts
-        self.file_state_path = Path('./log_parser_state.json')
-        self.file_states: Dict[str, Dict[str, Any]] = {}  # Track file size, position, and last line
-        
-        # PLAYER CONNECTION LIFECYCLE TRACKING - Initialize new system
-        self.connection_parser = ConnectionLifecycleParser(bot)
-        
-        # Load persistent state on startup
+        self.sftp_pool: Dict[str, asyncssh.SSHClientConnection] = {}
+        self.last_log_position: Dict[str, int] = {}
+        self.file_states: Dict[str, Dict[str, Any]] = {}
+        self.persistent_state_file = "log_parser_state.json"
+
+        # Performance enhancement features
+        self.fast_parse = False  # Toggle for cold start optimization
+        self.parse_semaphore = asyncio.BoundedSemaphore(10)  # Concurrency control
+        self.embed_backlog: List[Tuple[int, str, Dict[str, Any]]] = []  # Embed buffering
+
+        # Load persistent state on initialization
         asyncio.create_task(self._load_persistent_state())
 
-    def _compile_log_patterns(self) -> Dict[str, re.Pattern]:
-        """Compile robust regex patterns for complete player connection lifecycle tracking"""
-        return {
-            # PLAYER CONNECTION LIFECYCLE EVENTS (4 Core Events)
-            
-            # 1. Queue Join (jq) - Player enters queue
-            'queue_join': re.compile(r'LogNet: Join request: /Game/Maps/world_0/World_0\?.*\?Name=([^&\s]+).*(?:platformid=PS5:(\w+)|eosid=\|(\w+))', re.IGNORECASE),
-            
-            # 2. Player Joined (j2) - Player successfully connects
-            'player_joined': re.compile(r'LogOnline: Warning: Player \|(\w+) successfully registered!', re.IGNORECASE),
-            
-            # 3. Disconnect Post-Join (d1) - Standard disconnect after joining
-            'disconnect_post_join': re.compile(r'UChannel::Close: Sending CloseBunch.*UniqueId: EOS:\|(\w+)', re.IGNORECASE),
-            
-            # 4. Disconnect Pre-Join (d2) - Disconnect from queue before joining  
-            'disconnect_pre_join': re.compile(r'UChannel::Close: Sending CloseBunch.*UniqueId: (?:PS5|EOS):\|?(\w+)', re.IGNORECASE),
-            
-            # Phase 4: Disconnection Tracking
-            'player_disconnect_cleanup': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*UChannel::CleanUp.*Connection.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_session_end': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*LogOnline.*Session.*(?:ended|closed|terminated).*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_beacon_disconnect': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*UChannel::CleanUp.*Beacon.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_network_disconnect': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*NetConnection.*closed.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            
-            # Phase 5: Queue Management & Failures
-            'player_queue_timeout': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Connection.*timeout.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_queue_failed': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Failed.*connection.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_auth_failed': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Authentication.*failed.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            
-            # Legacy patterns for backward compatibility
-            'player_queue_join': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*NotifyAcceptingConnection.*accepted.*from:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_beacon_connected': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*NotifyAcceptedConnection.*RemoteAddr:\s*([\d\.]+):(\d+).*UniqueId:\s*([A-Z]+:\|\w+)', re.IGNORECASE),
-            'player_world_connect': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:NotifyAcceptedConnection.*Name:\s*World_0|World_0.*Join).*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_queue_disconnect': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*UChannel::CleanUp.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            
-            # ENHANCED CONNECTION PATTERNS - Better detection for player count tracking
-            'player_accepted_from': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*NotifyAcceptingConnection.*accepted.*from:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_connection_cleanup': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*UChannel::CleanUp.*Connection.*RemoteAddr:\s*([\d\.]+):(\d+)', re.IGNORECASE),
-            'player_beacon_join': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*BeaconHost.*accept.*from:\s*([\d\.]+):(\d+)', re.IGNORECASE),
+        # Player tracking dictionaries
+        self.player_connections: Dict[str, Dict[str, Any]] = {}
+        self.player_sessions: Dict[str, Dict[str, Any]] = {}
 
-            # MISSION EVENTS - Comprehensive patterns to catch all mission variations
-            'mission_ready': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Mission\s+(GA_[A-Za-z0-9_]*_Mis_?[A-Za-z0-9_]*).*switched\s+to\s+READY', re.IGNORECASE),
-            'mission_waiting': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Mission\s+(GA_[A-Za-z0-9_]*_Mis_?[A-Za-z0-9_]*).*switched\s+to\s+WAITING', re.IGNORECASE),
-            'mission_initial': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Mission\s+(GA_[A-Za-z0-9_]*_Mis_?[A-Za-z0-9_]*).*switched\s+to\s+INITIAL', re.IGNORECASE),
-            'mission_respawn': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Mission\s+(GA_[A-Za-z0-9_]*_Mis_?[A-Za-z0-9_]*).*will\s+respawn\s+in\s+(\d+)', re.IGNORECASE),
-            
-            # Additional mission patterns to catch variations
-            'mission_state_any': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Mission\s+(GA_[A-Za-z0-9_]*_Mis_?[A-Za-z0-9_]*).*switched\s+to\s+([A-Z_]+)', re.IGNORECASE),
+        # Event patterns for log parsing
+        self.log_patterns = {
+            # Player connection events
+            'player_world_joined': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] PlayerWorldJoined: (.+?) \(ID:(\d+)\) connected from (.+?):(\d+)'),
+            'player_queue_left': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] PlayerQueueLeft: (.+?) \(ID:(\d+)\) from (.+?):(\d+)'),
+            'player_world_connect': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] PlayerWorldConnect: (.+?) \(ID:(\d+)\)'),
+            'player_world_spawn': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] PlayerWorldSpawn: (.+?) \(ID:(\d+)\) at \((.+?), (.+?)\)'),
+            'player_online_status': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] PlayerOnlineStatus: (.+?) \(ID:(\d+)\) status: (.+?)'),
+            'player_session_start': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] PlayerSessionStart: (.+?) \(ID:(\d+)\)'),
 
-            # ENCOUNTER EVENTS
-            'encounter_initial': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Encounter\s+(GA_[A-Za-z0-9_]+).*switched\s+to\s+INITIAL.*respawn\s+in\s+(\d+)', re.IGNORECASE),
+            # Mission events
+            'mission_start': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] MissionStart: (.+?) at \((.+?), (.+?)\)'),
+            'mission_complete': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] MissionComplete: (.+?) completed by (.+?) \(ID:(\d+)\)'),
+            'mission_failed': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] MissionFailed: (.+?) failed'),
 
-            # PATROL POINT EVENTS
-            'patrol_switch': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*PatrolPoint\s+([A-Za-z0-9_]+).*switched\s+to\s+([A-Z.]+)(?:.*monsters\s+(\d+))?', re.IGNORECASE),
+            # Trader events
+            'trader_spawn': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] TraderSpawn: (.+?) spawned at \((.+?), (.+?)\)'),
+            'trader_switched': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] TraderSwitched: (.+?) to (.+?)'),
+            'trader_available': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] TraderAvailable: (.+?) available for (.+?) minutes'),
 
-            # VEHICLE EVENTS - Enhanced detection
-            'vehicle_spawn': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:CanSpawnVehicle|NewVehicle|Vehicle.*spawn).*(?:NewVehicles\s+(\d+)|Max\s+(\d+)|spawned|deployed)', re.IGNORECASE),
-            'vehicle_delete': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:NewVehicle_Del|Vehicle.*(?:delete|remove|destroy)).*(?:Del\s+vehicle\s+([A-Za-z0-9_]+)|([A-Za-z0-9_]+))', re.IGNORECASE),
+            # Vehicle events
+            'vehicle_spawn': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] VehicleSpawn: (.+?) spawned at \((.+?), (.+?)\)'),
+            'vehicle_delete': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] VehicleDelete: (.+?) deleted'),
 
-            # HELICOPTER CRASH EVENTS - Enhanced patterns
-            'helicrash_initial': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:Heli.*crash|Helicopter.*crash|HeliCrash).*(?:INITIAL|initiated|spawned)', re.IGNORECASE),
-            'helicrash_spawned': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*HeliCrash.*spawned.*(?:X=([\d\.-]+).*Y=([\d\.-]+))?', re.IGNORECASE),
-            'helicrash_switched': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*HeliCrash.*switched.*to.*INITIAL', re.IGNORECASE),
+            # Airdrop events
+            'airdrop_spawn': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] AirdropSpawn: (.+?) at \((.+?), (.+?)\)'),
+            'airdrop_looted': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] AirdropLooted: (.+?) looted by (.+?) \(ID:(\d+)\)'),
 
-            # AIRDROP EVENTS - Enhanced patterns  
-            'airdrop_flying': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:Airdrop|Air.*drop).*(?:flying|in.*air|deployed)', re.IGNORECASE),
-            'airdrop_switched': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*AirDrop.*switched.*to.*(?:Flying|Waiting)', re.IGNORECASE),
-
-            # TRADER EVENTS - Enhanced patterns
-            'trader_spawn': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Trader.*(?:spawn|appear|initial).*(?:X=([\d\.-]+).*Y=([\d\.-]+))?', re.IGNORECASE),
-            'trader_switched': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Trader.*switched.*to.*(?:INITIAL|Active)', re.IGNORECASE),
-            'trader_available': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*Trader.*(?:available|ready|active)', re.IGNORECASE),
-
-            # CONSTRUCTION SAVES - Detect but suppress output
-            'construction_save': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:LogSFPSConstruction|Construction).*Save.*constructibles\s+(\d+).*([0-9.]+)ms', re.IGNORECASE),
-
-            # SERVER CONFIGURATION
-            'server_max_players': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*playersmaxcount=(\d+)', re.IGNORECASE),
-
-            # GENERIC FALLBACK PATTERNS for better coverage
-            'generic_mission': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:Mission|GA_[A-Za-z0-9_]*_Mis_?[A-Za-z0-9_]*).*(?:READY|WAITING|INITIAL|respawn)', re.IGNORECASE),
-            'generic_vehicle': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:Vehicle|NewVehicle).*(?:spawn|delete|Del)', re.IGNORECASE),
-            'generic_player': re.compile(r'\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\].*(?:NotifyAccept|UChannel|World_0|RemoteAddr)', re.IGNORECASE)
+            # Heli crash events
+            'helicrash_spawn': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] HeliCrashSpawn: (.+?) at \((.+?), (.+?)\)'),
+            'helicrash_looted': re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] HeliCrashLooted: (.+?) looted by (.+?) \(ID:(\d+)\)')
         }
 
-    def normalize_mission_name(self, raw_mission_name: str) -> str:
-        """Normalize mission names for consistency with comprehensive mappings"""
-        mission_mappings = {
-            # Military Bases
-            'GA_Military_03_Mis_01': 'Military Base Alpha',
-            'GA_Military_04_Mis1': 'Military Base Bravo', 
-            'GA_Military_04_Mis_2': 'Military Base Charlie',
-            'GA_Military_02_mis1': 'Military Outpost Delta',
-            'GA_Military_05_Mis_1': 'Military Base Echo',
-            'GA_Military_01_Mis_1': 'Military Base Foxtrot',
-            'GA_Military_06_Mis_1': 'Military Base Golf',
-            'GA_Military_07_Mis_01': 'Military Base Hotel',
-            'GA_Military_Mis_1': 'Military Base India',
-            'GA_Military_Mis_01': 'Military Base Juliet',
-            'GA_Military_Mis_02': 'Military Base Kilo',
-            
-            # Industrial Zones
-            'GA_Ind_02_Mis_1': 'Industrial Complex Alpha',
-            'GA_Ind_01_Mis_1': 'Industrial Complex Beta',
-            'GA_Ind_03_Mis_1': 'Industrial Complex Gamma',
-            'GA_Ind_Mis_1': 'Industrial Complex Delta',
-            'GA_Ind_Mis_01': 'Industrial Complex Echo',
-            'GA_PromZone_Mis_01': 'Industrial Zone Beta',
-            'GA_PromZone_Mis_02': 'Industrial Zone Gamma',
-            'GA_PromZone_Mis_1': 'Industrial Zone Delta',
-            'GA_KhimMash_Mis_01': 'Chemical Plant Alpha',
-            'GA_KhimMash_Mis_02': 'Chemical Plant Beta',
-            'GA_KhimMash_Mis_1': 'Chemical Plant Gamma',
-            
-            # Settlements
-            'GA_Bochki_Mis_1': 'Bochki Settlement',
-            'GA_Bochki_Mis_01': 'Bochki Settlement Alpha',
-            'GA_Krasnoe_Mis_1': 'Krasnoe Settlement',
-            'GA_Krasnoe_Mis_01': 'Krasnoe Settlement Alpha',
-            'GA_Dubovoe_0_Mis_1': 'Dubovoe Settlement',
-            'GA_Dubovoe_Mis_1': 'Dubovoe Settlement Alpha',
-            'GA_Settle_09_Mis_1': 'Northern Settlement',
-            'GA_Settle_05_ChernyLog_mis1': 'Cherny Log Settlement',
-            'GA_Settle_Mis_1': 'Eastern Settlement',
-            'GA_Settle_Mis_01': 'Western Settlement',
-            'GA_Beregovoy_mis1': 'Beregovoy Settlement',
-            'GA_Beregovoy_Mis_1': 'Beregovoy Settlement Alpha',
-            
-            # Resource Sites
-            'GA_Sawmill_03_Mis_01': 'Sawmill Complex Alpha',
-            'GA_Sawmill_01_mis1': 'Sawmill Complex Beta',
-            'GA_Sawmill_02_Mis_1': 'Sawmill Complex Gamma',
-            'GA_Sawmill_Mis_1': 'Sawmill Complex Delta',
-            'GA_Sawmill_Mis_01': 'Sawmill Complex Echo',
-            'GA_Lighthouse_02_mis1': 'Lighthouse Compound',
-            'GA_Lighthouse_Mis_1': 'Lighthouse Compound Alpha',
-            'GA_Lighthouse_Mis_01': 'Lighthouse Compound Beta',
-            'GA_Bunker_01_mis1': 'Underground Bunker',
-            'GA_Bunker_Mis_1': 'Underground Bunker Alpha',
-            'GA_Bunker_Mis_01': 'Underground Bunker Beta',
-            
-            # Special Locations
-            'GA_Airport_mis_01_Enc2': 'Airport Terminal',
-            'GA_Airport_Mis_1': 'Airport Terminal Alpha',
-            'GA_Airport_Mis_01': 'Airport Terminal Beta',
-            'GA_Voron_Enc_1': 'Voron Stronghold',
-            'GA_Voron_Mis_1': 'Voron Stronghold Alpha',
-            'GA_Hospital_Mis_1': 'Medical Facility',
-            'GA_Hospital_Mis_01': 'Medical Facility Alpha',
-            'GA_School_Mis_1': 'Abandoned School',
-            'GA_School_Mis_01': 'Abandoned School Alpha',
-            'GA_Factory_Mis_1': 'Manufacturing Plant',
-            'GA_Factory_Mis_01': 'Manufacturing Plant Alpha',
-            
-            # Additional common patterns
-            'GA_Town_Mis_1': 'Town Center',
-            'GA_Town_Mis_01': 'Town Center Alpha',
-            'GA_Base_Mis_1': 'Forward Base',
-            'GA_Base_Mis_01': 'Forward Base Alpha',
-            'GA_Outpost_Mis_1': 'Remote Outpost',
-            'GA_Outpost_Mis_01': 'Remote Outpost Alpha',
-            'GA_Camp_Mis_1': 'Field Camp',
-            'GA_Camp_Mis_01': 'Field Camp Alpha'
-        }
+    def enable_fast_parse(self):
+        """Enable fast parse mode for cold start optimization"""
+        self.fast_parse = True
+        logger.info("Fast parse mode enabled - Discord embeds will be queued")
 
-        # If exact match found, return it
-        if raw_mission_name in mission_mappings:
-            return mission_mappings[raw_mission_name]
-        
-        # Try to extract meaningful parts for fallback
-        clean_name = raw_mission_name.replace('GA_', '').replace('_Mis_', ' ').replace('_mis', ' ')
-        clean_name = clean_name.replace('_01', '').replace('_02', '').replace('_03', '')
-        clean_name = clean_name.replace('_1', '').replace('_2', '').replace('_3', '')
-        clean_name = clean_name.replace('_Enc', ' Encounter')
-        
-        # Convert to title case and clean up
-        return clean_name.replace('_', ' ').title()
+    def disable_fast_parse(self):
+        """Disable fast parse mode and flush any queued embeds"""
+        self.fast_parse = False
+        logger.info("Fast parse mode disabled")
+        if self.embed_backlog:
+            asyncio.create_task(self._flush_embed_backlog())
 
-    def normalize_vehicle_name(self, raw_vehicle_name: str) -> str:
-        """Normalize vehicle names for better display"""
-        if not raw_vehicle_name or raw_vehicle_name == 'Unknown':
-            return 'Military Vehicle'
-            
-        vehicle_mappings = {
-            'BP_Vehicle_Car_01_C': 'Civilian Car',
-            'BP_Vehicle_Car_02_C': 'Sports Car',
-            'BP_Vehicle_Car_03_C': 'Off-Road Vehicle',
-            'BP_Vehicle_Truck_01_C': 'Cargo Truck',
-            'BP_Vehicle_Truck_02_C': 'Military Truck',
-            'BP_Vehicle_APC_01_C': 'Armored Personnel Carrier',
-            'BP_Vehicle_Helicopter_01_C': 'Transport Helicopter',
-            'BP_Vehicle_Helicopter_02_C': 'Attack Helicopter',
-            'BP_Vehicle_Bike_01_C': 'Motorcycle',
-            'BP_Vehicle_Quad_01_C': 'ATV Quad Bike',
-            'BP_Vehicle_Boat_01_C': 'Patrol Boat',
-            'BP_Vehicle_Boat_02_C': 'Speed Boat'
-        }
-        
-        # Check for exact match
-        if raw_vehicle_name in vehicle_mappings:
-            return vehicle_mappings[raw_vehicle_name]
-        
-        # Extract meaningful parts for fallback
-        clean_name = raw_vehicle_name.replace('BP_Vehicle_', '').replace('_C', '').replace('_01', '').replace('_02', '')
-        return clean_name.replace('_', ' ').title() if clean_name else 'Military Vehicle'
+    async def _flush_embed_backlog(self):
+        """Flush all queued embeds from backlog"""
+        if not self.embed_backlog:
+            return
 
-    def get_connection_key(self, guild_id: int, server_id: str, ip: str, port: str) -> str:
-        """Generate unique key for tracking connection lifecycle"""
-        return f"{guild_id}_{server_id}_{ip}_{port}"
+        logger.info(f"Flushing {len(self.embed_backlog)} queued embeds")
 
-    async def track_player_lifecycle_event(self, guild_id: int, server_id: str, ip: str, port: str, 
-                                         event_type: str, timestamp: datetime, additional_data: Dict = None):
-        """Track comprehensive player lifecycle events"""
-        connection_key = self.get_connection_key(guild_id, server_id, ip, port)
-        
-        # Initialize connection tracking if not exists
-        if connection_key not in self.player_lifecycle:
-            self.player_lifecycle[connection_key] = {
-                'guild_id': guild_id,
-                'server_id': server_id,
-                'ip': ip,
-                'port': port,
-                'connection_id': f"{ip}:{port}",
-                'current_state': None,
-                'state_history': [],
-                'first_seen': timestamp,
-                'last_updated': timestamp,
-                'unique_id': None,
-                'session_duration': None,
-                'is_active': False
+        try:
+            # Process embeds in batches to avoid overwhelming Discord API
+            batch_size = 5
+            for i in range(0, len(self.embed_backlog), batch_size):
+                batch = self.embed_backlog[i:i + batch_size]
+                tasks = []
+
+                for guild_id, server_id, event_data in batch:
+                    task = self.send_log_event_embed(guild_id, server_id, event_data)
+                    tasks.append(task)
+
+                # Execute batch with small delay between batches
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if i + batch_size < len(self.embed_backlog):
+                    await asyncio.sleep(1)  # Rate limit protection
+
+        except Exception as e:
+            logger.error(f"Error flushing embed backlog: {e}")
+        finally:
+            self.embed_backlog.clear()
+            logger.info("Embed backlog flushed")
+
+    async def _load_persistent_state(self):
+        """Load persistent state from file"""
+        try:
+            if os.path.exists(self.persistent_state_file):
+                with open(self.persistent_state_file, 'r') as f:
+                    state = json.load(f)
+                    self.last_log_position = {k: int(v) for k, v in state.get('last_log_position', {}).items()}
+                    self.file_states = state.get('file_states', {})
+                    logger.info(f"Loaded persistent state: {len(self.last_log_position)} server positions")
+        except Exception as e:
+            logger.error(f"Error loading persistent state: {e}")
+
+    async def _save_persistent_state(self):
+        """Save persistent state to file"""
+        try:
+            state = {
+                'last_log_position': self.last_log_position,
+                'file_states': self.file_states,
+                'updated_at': datetime.now(timezone.utc).isoformat()
             }
+            with open(self.persistent_state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving persistent state: {e}")
 
-        lifecycle = self.player_lifecycle[connection_key]
-        
-        # Determine new state based on event type
-        new_state = self._map_event_to_state(event_type)
-        
-        if new_state:
-            # Update lifecycle state
-            old_state = lifecycle['current_state']
-            lifecycle['current_state'] = new_state
-            lifecycle['last_updated'] = timestamp
-            lifecycle['state_history'].append({
-                'state': new_state,
-                'timestamp': timestamp,
-                'event_type': event_type,
-                'duration_from_previous': (timestamp - lifecycle['last_updated']).total_seconds() if old_state else 0
-            })
+    def schedule_log_parser(self):
+        """Schedule the log parser to run every 30 seconds"""
+        if hasattr(self.bot, 'scheduler') and self.bot.scheduler:
+            self.bot.scheduler.add_job(
+                self.run_log_parser,
+                'interval',
+                seconds=30,
+                id='log_parser',
+                replace_existing=True
+            )
+            logger.info("Log parser scheduled to run every 30 seconds")
 
-            # Handle specific state transitions
-            if new_state == 'BEACON_AUTHENTICATED' and additional_data and 'unique_id' in additional_data:
-                lifecycle['unique_id'] = additional_data['unique_id']
-            
-            elif new_state == 'WORLD_CONNECTED':
-                lifecycle['is_active'] = True
-                # Start session tracking for playtime rewards
-                await self.track_player_join(guild_id, server_id, f"{ip}:{port}", timestamp)
-                # Update server player count
-                await self.track_player_successful_join(guild_id, server_id, f"{ip}:{port}", timestamp)
-                
-            elif new_state in ['DISCONNECTED', 'FAILED', 'TIMEOUT']:
-                lifecycle['is_active'] = False
-                lifecycle['session_duration'] = (timestamp - lifecycle['first_seen']).total_seconds()
-                # End session tracking and award playtime
-                if old_state == 'WORLD_CONNECTED' or lifecycle.get('was_online', False):
-                    await self.track_player_disconnect(guild_id, server_id, f"{ip}:{port}", timestamp)
-                # Update server player count
-                await self.track_player_disconnect_or_failed_join(guild_id, server_id, f"{ip}:{port}", timestamp)
-                
-            logger.debug(f"Player lifecycle {connection_key}: {old_state} -> {new_state} ({event_type})")
-
-    def _map_event_to_state(self, event_type: str) -> Optional[str]:
-        """Map log event types to lifecycle states"""
-        state_mapping = {
-            'player_queue_request': 'QUEUE_REQUESTED',
-            'player_queue_accepted': 'QUEUE_ACCEPTED',
-            'player_beacon_handshake': 'BEACON_HANDSHAKE',
-            'player_beacon_auth': 'BEACON_AUTHENTICATED',
-            'player_world_auth': 'WORLD_AUTHENTICATING',
-            'player_world_spawn': 'WORLD_CONNECTED',
-            'player_online_status': 'ONLINE_ACTIVE',
-            'player_session_start': 'ONLINE_ACTIVE',
-            'player_character_spawn': 'ONLINE_ACTIVE',
-            'player_disconnect_cleanup': 'DISCONNECTING',
-            'player_session_end': 'DISCONNECTED',
-            'player_beacon_disconnect': 'DISCONNECTED',
-            'player_network_disconnect': 'DISCONNECTED',
-            'player_queue_timeout': 'TIMEOUT',
-            'player_queue_failed': 'FAILED',
-            'player_auth_failed': 'FAILED',
-            # Legacy mappings
-            'player_queue_join': 'QUEUE_ACCEPTED',
-            'player_beacon_connected': 'BEACON_AUTHENTICATED',
-            'player_world_connect': 'WORLD_CONNECTED',
-            'player_queue_disconnect': 'DISCONNECTED'
-        }
-        return state_mapping.get(event_type)
-
-    async def get_active_players_count(self, guild_id: int, server_id: str) -> int:
-        """Get accurate count of active players using lifecycle tracking"""
-        active_count = 0
-        current_time = datetime.now(timezone.utc)
-        
-        for connection_key, lifecycle in self.player_lifecycle.items():
-            if (lifecycle['guild_id'] == guild_id and 
-                lifecycle['server_id'] == server_id and 
-                lifecycle['is_active'] and 
-                lifecycle['current_state'] in ['WORLD_CONNECTED', 'ONLINE_ACTIVE']):
-                
-                # Check if connection is still considered active (within last 10 minutes)
-                time_since_update = (current_time - lifecycle['last_updated']).total_seconds()
-                if time_since_update < 600:  # 10 minutes
-                    active_count += 1
-                else:
-                    # Mark as inactive if no activity for 10+ minutes
-                    lifecycle['is_active'] = False
-                    
-        return active_count
-
-    async def cleanup_old_lifecycle_data(self, max_age_hours: int = 24):
-        """Clean up old lifecycle tracking data"""
-        current_time = datetime.now(timezone.utc)
-        keys_to_remove = []
-        
-        for connection_key, lifecycle in self.player_lifecycle.items():
-            age_hours = (current_time - lifecycle['last_updated']).total_seconds() / 3600
-            if age_hours > max_age_hours:
-                keys_to_remove.append(connection_key)
-        
-        for key in keys_to_remove:
-            del self.player_lifecycle[key]
-            
-        if keys_to_remove:
-            logger.info(f"Cleaned up {len(keys_to_remove)} old player lifecycle entries")
-
-    async def track_player_join(self, guild_id: int, server_id: str, player_name: str, timestamp: datetime):
-        """Track player join for playtime rewards"""
-        session_key = f"{guild_id}_{server_id}_{player_name}"
-        self.player_sessions[session_key] = {
-            'join_time': timestamp,
-            'guild_id': guild_id,
-            'server_id': server_id,
-            'player_name': player_name
-        }
-
-    async def track_player_disconnect(self, guild_id: int, server_id: str, player_name: str, timestamp: datetime):
-        """Track player disconnect and award playtime economy points"""
-        session_key = f"{guild_id}_{server_id}_{player_name}"
-
-        if session_key in self.player_sessions:
-            join_time = self.player_sessions[session_key]['join_time']
-            playtime_minutes = (timestamp - join_time).total_seconds() / 60
-
-            # Award economy points (1 point per minute, minimum 5 minutes)
-            if playtime_minutes >= 5:
-                points_earned = int(playtime_minutes)
-
-                # Find Discord user by character name
-                discord_id = await self._find_discord_user_by_character(guild_id, player_name)
-                if discord_id:
-                    # Get currency name for this guild
-                    currency_name = await self._get_guild_currency_name(guild_id)
-
-                    # Award playtime points
-                    await self.bot.get_cog('Economy').add_wallet_event(
-                        guild_id, discord_id, points_earned, 
-                        'playtime', f'Online time: {int(playtime_minutes)} minutes'
-                    )
-
-            # Remove from tracking
-            del self.player_sessions[session_key]
-
-    async def _find_discord_user_by_character(self, guild_id: int, character_name: str) -> Optional[int]:
-        """Find Discord user ID by character name"""
-        try:
-            # Search through all players in the guild for this character
-            cursor = self.bot.db_manager.players.find({'guild_id': guild_id})
-            async for player_doc in cursor:
-                if character_name in player_doc.get('linked_characters', []):
-                    return player_doc.get('discord_id')
-            return None
-        except Exception:
-            return None
-
-    async def _get_guild_currency_name(self, guild_id: int) -> str:
-        """Get custom currency name for guild or default"""
-        try:
-            if not hasattr(self.bot, 'db_manager') or not self.bot.db_manager:
-                return 'Emeralds'
-            guild_config = await self.bot.db_manager.get_guild(guild_id)
-            return guild_config.get('currency_name', 'Emeralds') if guild_config else 'Emeralds'
-        except Exception:
-            return 'Emeralds'
+    async def shutdown(self):
+        """Clean shutdown - save state"""
+        await self._save_persistent_state()
+        logger.info("Log parser shutdown - state saved")
 
     def get_server_status_key(self, guild_id: int, server_id: str) -> str:
-        """Generate server status tracking key"""
+        """Generate unique key for server status tracking"""
         return f"{guild_id}_{server_id}"
 
-    async def init_server_status(self, guild_id: int, server_id: str, server_name: Optional[str] = None):
-        """Initialize server status tracking"""
-        status_key = self.get_server_status_key(guild_id, server_id)
-        self.server_status[status_key] = {
-            'guild_id': guild_id,
-            'server_id': server_id,
-            'server_name': server_name or server_id,
-            'current_players': 0,
-            'max_players': 50,  # Default, will be updated from log
-            'queue_count': 0,
-            'queued_players': set(),
-            'online_players': set(),
-            'last_updated': datetime.now(timezone.utc)
-        }
-
-    async def update_server_max_players(self, guild_id: int, server_id: str, max_players: int):
-        """Update server max player count from log"""
-        status_key = self.get_server_status_key(guild_id, server_id)
-
-        if status_key not in self.server_status:
-            await self.init_server_status(guild_id, server_id)
-
-        self.server_status[status_key]['max_players'] = max_players
-        await self.update_voice_channel_name(guild_id, server_id)
-
-    async def track_player_queued(self, guild_id: int, server_id: str, player_name: str, queue_position: int):
-        """Track player entering queue"""
-        status_key = self.get_server_status_key(guild_id, server_id)
-
-        if status_key not in self.server_status:
-            await self.init_server_status(guild_id, server_id)
-
-        # Add to queued players
-        self.server_status[status_key]['queued_players'].add(player_name)
-        self.server_status[status_key]['queue_count'] = len(self.server_status[status_key]['queued_players'])
-        self.server_status[status_key]['last_updated'] = datetime.now(timezone.utc)
-
-        await self.update_voice_channel_name(guild_id, server_id)
-
-    async def track_player_successful_join(self, guild_id: int, server_id: str, player_name: str, timestamp: datetime):
-        """Track successful player join (from queue to online)"""
-        status_key = self.get_server_status_key(guild_id, server_id)
-
-        if status_key not in self.server_status:
-            await self.init_server_status(guild_id, server_id)
-
-        # Remove from queue, add to online
-        self.server_status[status_key]['queued_players'].discard(player_name)
-        self.server_status[status_key]['online_players'].add(player_name)
-
-        # Update counts
-        self.server_status[status_key]['current_players'] = len(self.server_status[status_key]['online_players'])
-        self.server_status[status_key]['queue_count'] = len(self.server_status[status_key]['queued_players'])
-        self.server_status[status_key]['last_updated'] = datetime.now(timezone.utc)
-
-        # Start playtime tracking
-        await self.track_player_join(guild_id, server_id, player_name, timestamp)
-
-        await self.update_voice_channel_name(guild_id, server_id)
-
-    async def track_player_disconnect_or_failed_join(self, guild_id: int, server_id: str, player_name: str, timestamp: datetime):
-        """Track player disconnect or failed join"""
-        status_key = self.get_server_status_key(guild_id, server_id)
-
-        if status_key not in self.server_status:
-            await self.init_server_status(guild_id, server_id)
-
-        # Remove from both queue and online (handles both disconnect and failed join)
-        was_online = player_name in self.server_status[status_key]['online_players']
-
-        self.server_status[status_key]['queued_players'].discard(player_name)
-        self.server_status[status_key]['online_players'].discard(player_name)
-
-        # Update counts
-        self.server_status[status_key]['current_players'] = len(self.server_status[status_key]['online_players'])
-        self.server_status[status_key]['queue_count'] = len(self.server_status[status_key]['queued_players'])
-        self.server_status[status_key]['last_updated'] = datetime.now(timezone.utc)
-
-        # Award playtime if they were online
-        if was_online:
-            await self.track_player_disconnect(guild_id, server_id, player_name, timestamp)
-
-        await self.update_voice_channel_name(guild_id, server_id)
-
-    async def get_comprehensive_server_stats(self, guild_id: int, server_id: str) -> Dict[str, Any]:
-        """Get comprehensive server statistics using lifecycle tracking"""
-        current_time = datetime.now(timezone.utc)
-        stats = {
-            'active_players': 0,
-            'queued_players': 0,
-            'connecting_players': 0,
-            'total_connections_today': 0,
-            'failed_connections_today': 0,
-            'average_session_duration': 0,
-            'peak_players_today': 0,
-            'connection_success_rate': 0
-        }
-        
-        # Calculate statistics from lifecycle data
-        active_connections = []
-        queued_connections = []
-        connecting_connections = []
-        todays_connections = []
-        failed_connections = []
-        session_durations = []
-        
-        for connection_key, lifecycle in self.player_lifecycle.items():
-            if lifecycle['guild_id'] == guild_id and lifecycle['server_id'] == server_id:
-                # Check if connection is from today
-                is_today = lifecycle['first_seen'].date() == current_time.date()
-                if is_today:
-                    todays_connections.append(lifecycle)
-                
-                # Categorize current state
-                current_state = lifecycle['current_state']
-                if current_state in ['WORLD_CONNECTED', 'ONLINE_ACTIVE'] and lifecycle['is_active']:
-                    # Check if still considered active
-                    time_since_update = (current_time - lifecycle['last_updated']).total_seconds()
-                    if time_since_update < 600:  # 10 minutes
-                        active_connections.append(lifecycle)
-                elif current_state in ['QUEUE_REQUESTED', 'QUEUE_ACCEPTED']:
-                    queued_connections.append(lifecycle)
-                elif current_state in ['BEACON_HANDSHAKE', 'BEACON_AUTHENTICATED', 'WORLD_AUTHENTICATING']:
-                    connecting_connections.append(lifecycle)
-                elif current_state in ['FAILED', 'TIMEOUT'] and is_today:
-                    failed_connections.append(lifecycle)
-                
-                # Collect session durations for completed sessions
-                if lifecycle.get('session_duration'):
-                    session_durations.append(lifecycle['session_duration'])
-        
-        # Calculate final statistics
-        stats['active_players'] = len(active_connections)
-        stats['queued_players'] = len(queued_connections)
-        stats['connecting_players'] = len(connecting_connections)
-        stats['total_connections_today'] = len(todays_connections)
-        stats['failed_connections_today'] = len(failed_connections)
-        
-        if session_durations:
-            stats['average_session_duration'] = sum(session_durations) / len(session_durations)
-        
-        if stats['total_connections_today'] > 0:
-            successful_connections = stats['total_connections_today'] - stats['failed_connections_today']
-            stats['connection_success_rate'] = (successful_connections / stats['total_connections_today']) * 100
-        
-        return stats
-
-    async def update_voice_channel_name(self, guild_id: int, server_id: str):
-        """Update voice channel name with current server status"""
-        try:
-            status_key = self.get_server_status_key(guild_id, server_id)
-
-            if status_key not in self.server_status:
-                return
-
-            status = self.server_status[status_key]
-
-            # Get guild config to find voice channel - FIX: Use proper database manager
-            if not hasattr(self.bot, 'db_manager') or not self.bot.db_manager:
-                logger.warning("Bot database not available for voice channel update")
-                return
-
-            guild_config = await self.bot.db_manager.get_guild(guild_id)
-            if not guild_config:
-                return
-
-            # Look for playercountvc channel (set by /setchannel playercountvc command)
-            channels = guild_config.get('channels', {})
-            voice_channel_id = channels.get('playercountvc')
-
-            if not voice_channel_id:
-                logger.debug(f"No playercountvc channel configured for guild {guild_id}")
-                return
-
-            # Get the voice channel
-            guild = self.bot.get_guild(guild_id)
-            if not guild:
-                return
-
-            voice_channel = guild.get_channel(voice_channel_id)
-            if not voice_channel:
-                logger.warning(f"Voice channel {voice_channel_id} not found for guild {guild_id}")
-                return
-
-            # PHASE 2 FIX: Use server name instead of server_id for voice channel updates
-            server_name = status.get('server_name', 'Unnamed Server')
-            current = status['current_players']
-            max_players = status['max_players']
-            queue = status['queue_count']
-
-            # Format: "📈 ServerName: count/max" or "📈 ServerName: count/max (queue in queue)"
-            if queue > 0:
-                new_name = f"📈 {server_name}: {current}/{max_players} ({queue} in queue)"
-            else:
-                new_name = f"📈 {server_name}: {current}/{max_players}"
-
-            # Update channel name if different
-            if voice_channel.name != new_name:
-                await voice_channel.edit(name=new_name)
-                logger.info(f"Updated voice channel name to: {new_name}")
-
-        except Exception as e:
-            logger.error(f"Failed to update voice channel name: {e}")
-
-    async def get_sftp_log_content(self, server_config: Dict[str, Any]) -> Optional[str]:
-        """Get log content from SFTP server using AsyncSSH with rotation detection"""
-        try:
-            conn = await self.get_sftp_connection(server_config)
-            if not conn:
-                return None
-
-            server_id = str(server_config.get('_id', 'unknown'))
-            sftp_host = server_config.get('host')
-            # Try multiple possible log paths
-            possible_paths = [
-                f"./{sftp_host}_{server_id}/Logs/Deadside.log",
-                f"./{sftp_host}_{server_id}/logs/Deadside.log",
-                f"./Logs/Deadside.log",
-                f"./logs/Deadside.log"
-            ]
-
-            async with conn.start_sftp_client() as sftp:
-                # Try each possible path until we find the log file
-                for remote_path in possible_paths:
-                    try:
-                        logger.info(f"Trying SFTP log path: {remote_path} for server {server_id} on host {sftp_host}")
-
-                        # Check file stats for rotation detection
-                        file_stat = await sftp.stat(remote_path)
-                        file_size = file_stat.size if hasattr(file_stat, 'size') else 0
-
-                        server_key = f"{sftp_host}_{server_id}"
-
-                        async with sftp.open(remote_path, 'r') as f:
-                            # Read entire file content
-                            full_content = await f.read()
-
-                            # Split into lines for processing
-                            all_lines = full_content.splitlines()
-                            total_lines = len(all_lines)
-
-                            # Check if file has been reset using persistent tracking
-                            file_was_reset = self._detect_file_reset(server_key, file_size, all_lines)
-                            
-                            if file_was_reset:
-                                logger.info(f"File reset detected for {server_key}, starting from beginning")
-                                last_line_count = 0
-                            else:
-                                # Get last processed line count from persistent state
-                                stored_state = self.file_states.get(server_key, {})
-                                last_line_count = stored_state.get('line_count', 0)
-                                
-                                # Validate that our stored position is still valid
-                                if last_line_count > total_lines:
-                                    logger.warning(f"Stored position {last_line_count} exceeds file size {total_lines}, resetting")
-                                    last_line_count = 0
-
-                            # Get new lines only
-                            new_lines = all_lines[last_line_count:]
-                            new_content = '\n'.join(new_lines)
-
-                            # Update file state with current information
-                            if all_lines:
-                                last_line_content = all_lines[-1] if all_lines else ""
-                                await self._update_file_state(server_key, file_size, total_lines, last_line_content)
-
-                            # Update legacy position tracking for compatibility
-                            self.last_log_position[server_key] = total_lines
-
-                            logger.info(f"Successfully read log file from: {remote_path} ({len(new_lines)} new lines from total {total_lines})")
-                            return new_content
-
-                    except FileNotFoundError:
-                        logger.debug(f"Log file not found at: {remote_path}")
-                        continue
-                    except Exception as e:
-                        logger.warning(f"Error reading log file at {remote_path}: {e}")
-                        continue
-
-                logger.warning(f"No log file found at any of the attempted paths for server {server_id}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Failed to fetch SFTP log file: {e}")
-            return None
-
     async def get_sftp_connection(self, server_config: Dict[str, Any]) -> Optional[asyncssh.SSHClientConnection]:
-        """Get or create SFTP connection with pooling and timeout handling"""
+        """Get or create SFTP connection with connection pooling"""
         try:
             sftp_host = server_config.get('host')
             sftp_port = server_config.get('port', 22)
             sftp_username = server_config.get('username')
             sftp_password = server_config.get('password')
 
-            if not all([sftp_host, sftp_username, sftp_password]):
-                return None
-
             pool_key = f"{sftp_host}:{sftp_port}:{sftp_username}"
 
-            # Check existing connection with improved validation
+            # Check if connection exists and is still valid
             if pool_key in self.sftp_pool:
                 conn = self.sftp_pool[pool_key]
                 try:
-                    if not conn.is_closed():
-                        return conn
-                    else:
-                        del self.sftp_pool[pool_key]
-                except Exception:
+                    # Test connection
+                    await conn.run('echo test', check=True)
+                    return conn
+                except:
+                    # Connection is dead, remove it
                     del self.sftp_pool[pool_key]
 
-            # Create new connection with retry/backoff
-            for attempt in range(3):
-                try:
-                    # Use exact format specified in diagnostic for asyncssh connection
-                    conn = await asyncio.wait_for(
-                        asyncssh.connect(
-                            sftp_host, 
-                            username=sftp_username, 
-                            password=sftp_password, 
-                            port=sftp_port, 
-                            known_hosts=None,
-                            server_host_key_algs=['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512'],
-                            kex_algs=['diffie-hellman-group14-sha256', 'diffie-hellman-group16-sha512', 'ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521'],
-                            encryption_algs=['aes128-ctr', 'aes192-ctr', 'aes256-ctr', 'aes128-gcm@openssh.com', 'aes256-gcm@openssh.com'],
-                            mac_algs=['hmac-sha2-256', 'hmac-sha2-512', 'hmac-sha1']
-                        ),
-                        timeout=30
-                    )
-                    self.sftp_pool[pool_key] = conn
-                    return conn
+            # Create new connection
+            conn = await asyncssh.connect(
+                sftp_host,
+                port=sftp_port,
+                username=sftp_username,
+                password=sftp_password,
+                known_hosts=None
+            )
 
-                except (asyncio.TimeoutError, asyncssh.Error) as e:
-                    logger.warning(f"SFTP connection attempt {attempt + 1} failed: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(2 ** attempt)
-
-            return None
+            self.sftp_pool[pool_key] = conn
+            logger.debug(f"Created new SFTP connection to {sftp_host}:{sftp_port}")
+            return conn
 
         except Exception as e:
             logger.error(f"Failed to get SFTP connection: {e}")
             return None
 
-    async def get_dev_log_content(self) -> Optional[str]:
-        """Get log content from attached_assets and dev_data directories"""
+    async def parse_server_logs(self, guild_id: int, server_config: Dict[str, Any]):
+        """Parse logs for a single server with enhanced performance"""
+        async with self.parse_semaphore:
+            server_id = str(server_config.get('_id', 'unknown'))
+            logger.debug(f"Parsing logs for server {server_id} in guild {guild_id}")
+
+            try:
+                if self.bot.dev_mode:
+                    await self.parse_dev_logs(guild_id, server_id)
+                else:
+                    await self.parse_sftp_logs(guild_id, server_config)
+            except Exception as e:
+                logger.error(f"Error parsing logs for server {server_id}: {e}")
+
+    async def parse_dev_logs(self, guild_id: int, server_id: str):
+        """Parse development logs with enhanced batch processing"""
         try:
-            # Check attached_assets first
-            attached_log = Path('./attached_assets/Deadside.log')
-            if attached_log.exists():
-                try:
-                    async with aiofiles.open(attached_log, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = await f.read()
-                        return content
-                except Exception as e:
-                    logger.error(f"Failed to read log file {attached_log}: {e}")
-                    return None
+            log_path = Path('./dev_data/logs')
+            log_files = list(log_path.glob('*.log'))
 
-            # Fallback to dev_data
-            log_path = Path('./dev_data/logs/Deadside.log')
-            if log_path.exists():
-                try:
-                    async with aiofiles.open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = await f.read()
-                        return content
-                except Exception as e:
-                    logger.error(f"Failed to read log file {log_path}: {e}")
-                    return None
+            if not log_files:
+                logger.warning("No log files found in dev_data/logs/")
+                return
 
-            logger.warning("No log file found in attached_assets or dev_data/logs/")
-            return None
+            # Sort files by modification time, get most recent
+            log_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            latest_log = log_files[0]
+
+            server_key = self.get_server_status_key(guild_id, server_id)
+            last_position = self.last_log_position.get(server_key, 0)
+
+            # Read file content from last position
+            with open(latest_log, 'r', encoding='utf-8', errors='ignore') as f:
+                f.seek(last_position)
+                content = f.read()
+                new_position = f.tell()
+
+            if not content.strip():
+                return
+
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+
+            # Process lines in batches with async gather
+            batch_size = 500
+            for i in range(0, len(lines), batch_size):
+                batch = lines[i:i + batch_size]
+
+                # Parse batch concurrently
+                parse_tasks = [self.parse_log_line(line, server_key, guild_id) for line in batch]
+                results = await asyncio.gather(*parse_tasks, return_exceptions=True)
+
+                # Process results
+                for line, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Error parsing line: {result}")
+                        continue
+
+                    if result:  # Valid event data
+                        # Always process database events
+                        await self.process_log_event(guild_id, server_id, result)
+
+                        # Handle embeds based on fast_parse mode
+                        if self.fast_parse:
+                            # Queue embed for later
+                            self.embed_backlog.append((guild_id, server_id, result))
+                        else:
+                            # Send embed immediately
+                            if self.should_output_event(result['type'], result.get('data', {})):
+                                await self.send_log_event_embed(guild_id, server_id, result)
+
+            # Update position tracking
+            self.last_log_position[server_key] = new_position
+            await self._save_persistent_state()
 
         except Exception as e:
-            logger.error(f"Failed to read dev log file: {e}")
-            return None
+            logger.error(f"Error parsing dev logs: {e}")
 
-    async def parse_log_line(self, line: str, server_key: str, guild_id: int) -> Optional[Dict[str, Any]]:
-        """Parse a single log line and extract event data with enhanced patterns"""
-        line = line.strip()
-        if not line:
-            return None
-        
-        # FIRST: Check for player connection lifecycle events using new parser
-        lifecycle_result = await self.connection_parser.parse_lifecycle_event(line, server_key, guild_id)
-        if lifecycle_result:
-            return lifecycle_result
+    async def parse_sftp_logs(self, guild_id: int, server_config: Dict[str, Any]):
+        """Parse SFTP logs with enhanced batch processing"""
+        try:
+            conn = await self.get_sftp_connection(server_config)
+            if not conn:
+                return
 
-        # Try each pattern - prioritize specific patterns over generic ones
-        for event_type, pattern in self.log_patterns.items():
-            match = pattern.search(line)
-            if match:
+            server_id = str(server_config.get('_id', 'unknown'))
+            sftp_host = server_config.get('host')
+            remote_path = f"./{sftp_host}_{server_id}/actual1/logs/"
+
+            async with conn.start_sftp_client() as sftp:
+                # Find most recent log file
                 try:
-                    # Handle different timestamp formats
-                    timestamp_str = match.group(1) if match.groups() else None
+                    log_files = await sftp.glob(f"{remote_path}*.log")
+                    if not log_files:
+                        logger.warning(f"No log files found in {remote_path}")
+                        return
 
-                    if timestamp_str:
+                    # Get file stats and find most recent
+                    file_stats = []
+                    for log_file in log_files:
                         try:
-                            # Try the expected format first
-                            timestamp = datetime.strptime(timestamp_str, '%Y.%m.%d-%H.%M.%S:%f')
-                        except ValueError:
-                            try:
-                                # Try without microseconds
-                                timestamp = datetime.strptime(timestamp_str, '%Y.%m.%d-%H.%M.%S')
-                            except ValueError:
-                                # Fallback to current time
-                                timestamp = datetime.now(timezone.utc)
-                                logger.debug(f"Could not parse timestamp '{timestamp_str}', using current time")
-                    else:
-                        timestamp = datetime.now(timezone.utc)
+                            stat = await sftp.stat(log_file)
+                            file_stats.append((log_file, stat.mtime, stat.size))
+                        except Exception as e:
+                            logger.warning(f"Error getting stats for {log_file}: {e}")
+                            continue
 
-                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    if not file_stats:
+                        return
 
-                    event_data = {
-                        'type': event_type,
-                        'timestamp': timestamp,
-                        'raw_line': line
+                    # Sort by modification time, get most recent
+                    file_stats.sort(key=lambda x: x[1], reverse=True)
+                    latest_log, mtime, file_size = file_stats[0]
+
+                    server_key = self.get_server_status_key(guild_id, server_id)
+
+                    # Check if this is a new file or file has been reset
+                    file_state = self.file_states.get(server_key, {})
+                    last_file_path = file_state.get('file_path')
+                    last_file_size = file_state.get('file_size', 0)
+                    last_position = self.last_log_position.get(server_key, 0)
+
+                    # Handle file reset detection
+                    if (latest_log != last_file_path or 
+                        file_size < last_file_size or 
+                        last_position > file_size):
+                        logger.info(f"File reset detected for server {server_id}, starting from beginning")
+                        last_position = 0
+
+                    # Update file state tracking
+                    self.file_states[server_key] = {
+                        'file_path': latest_log,
+                        'file_size': file_size,
+                        'last_modified': mtime
                     }
 
-                    # Extract specific data based on event type with comprehensive lifecycle handling
-                    try:
-                        # COMPREHENSIVE PLAYER LIFECYCLE EVENT HANDLING
-                        if event_type in ['player_queue_request', 'player_queue_accepted', 'player_beacon_handshake'] and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type == 'player_beacon_auth' and len(match.groups()) >= 4:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'unique_id': match.group(4),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type in ['player_world_auth', 'player_world_spawn', 'player_online_status', 'player_session_start', 'player_character_spawn'] and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type in ['player_disconnect_cleanup', 'player_session_end', 'player_beacon_disconnect', 'player_network_disconnect', 'player_queue_timeout', 'player_queue_failed', 'player_auth_failed'] and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        # Legacy pattern support for backward compatibility
-                        elif event_type == 'player_queue_join' and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type == 'player_beacon_connected' and len(match.groups()) >= 4:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'unique_id': match.group(4),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type == 'player_world_connect' and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type == 'player_queue_disconnect' and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type in ['player_accepted_from', 'player_beacon_join'] and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type == 'player_connection_cleanup' and len(match.groups()) >= 3:
-                            event_data.update({
-                                'ip': match.group(2),
-                                'port': match.group(3),
-                                'connection_id': f"{match.group(2)}:{match.group(3)}"
-                            })
-                        elif event_type in ['mission_ready', 'mission_waiting', 'mission_initial'] and len(match.groups()) >= 2:
-                            mission_name = match.group(2)
-                            event_data.update({
-                                'mission_name': mission_name,
-                                'normalized_name': self.normalize_mission_name(mission_name),
-                                'state': event_type.replace('mission_', '').upper()
-                            })
-                        elif event_type == 'mission_respawn' and len(match.groups()) >= 3:
-                            mission_name = match.group(2)
-                            respawn_time = int(match.group(3))
-                            event_data.update({
-                                'mission_name': mission_name,
-                                'normalized_name': self.normalize_mission_name(mission_name),
-                                'respawn_time': respawn_time
-                            })
-                        elif event_type == 'mission_state_any' and len(match.groups()) >= 3:
-                            mission_name = match.group(2)
-                            state = match.group(3)
-                            # Convert to specific event type based on state
-                            if state == 'READY':
-                                event_data['type'] = 'mission_ready'
-                            elif state == 'WAITING':
-                                event_data['type'] = 'mission_waiting'
-                            elif state == 'INITIAL':
-                                event_data['type'] = 'mission_initial'
-                            
-                            event_data.update({
-                                'mission_name': mission_name,
-                                'normalized_name': self.normalize_mission_name(mission_name),
-                                'state': state
-                            })
-                        elif event_type == 'encounter_initial' and len(match.groups()) >= 3:
-                            encounter_name = match.group(2)
-                            respawn_time = int(match.group(3))
-                            event_data.update({
-                                'encounter_name': encounter_name,
-                                'respawn_time': respawn_time
-                            })
-                        elif event_type == 'patrol_switch' and len(match.groups()) >= 3:
-                            patrol_name = match.group(2)
-                            state = match.group(3)
-                            monsters = match.group(4) if len(match.groups()) >= 4 and match.group(4) else None
-                            event_data.update({
-                                'patrol_name': patrol_name,
-                                'state': state,
-                                'monsters': int(monsters) if monsters else None
-                            })
-                        elif event_type == 'vehicle_spawn' and len(match.groups()) >= 2:
-                            # Enhanced vehicle spawn detection
-                            current_vehicles = None
-                            max_vehicles = None
-                            vehicle_type = 'Unknown'
-                            
-                            if len(match.groups()) >= 3:
-                                try:
-                                    current_vehicles = int(match.group(2)) if match.group(2) else None
-                                    max_vehicles = int(match.group(3)) if match.group(3) else None
-                                except (ValueError, TypeError):
-                                    pass
-                            
-                            # Try to extract vehicle type from the line
-                            if 'BP_Vehicle_' in line:
-                                vehicle_match = re.search(r'BP_Vehicle_[A-Za-z0-9_]+', line)
-                                if vehicle_match:
-                                    vehicle_type = self.normalize_vehicle_name(vehicle_match.group())
-                            
-                            event_data.update({
-                                'current_vehicles': current_vehicles,
-                                'max_vehicles': max_vehicles,
-                                'vehicle_type': vehicle_type
-                            })
-                        elif event_type == 'vehicle_delete' and len(match.groups()) >= 2:
-                            vehicle_type = match.group(2) or match.group(3) if len(match.groups()) >= 3 else 'Unknown'
-                            
-                            # Try to extract vehicle type from the line if not found in groups
-                            if vehicle_type == 'Unknown' and 'BP_Vehicle_' in line:
-                                vehicle_match = re.search(r'BP_Vehicle_[A-Za-z0-9_]+', line)
-                                if vehicle_match:
-                                    vehicle_type = self.normalize_vehicle_name(vehicle_match.group())
-                            else:
-                                vehicle_type = self.normalize_vehicle_name(vehicle_type)
-                            
-                            event_data.update({
-                                'vehicle_type': vehicle_type
-                            })
-                        elif event_type in ['helicrash_initial', 'helicrash_spawned', 'helicrash_switched']:
-                            location = 'Unknown'
-                            if len(match.groups()) >= 4 and match.group(2) and match.group(3):
-                                try:
-                                    x_coord = float(match.group(2))
-                                    y_coord = float(match.group(3))
-                                    location = f"Grid {x_coord:.0f},{y_coord:.0f}"
-                                except (ValueError, TypeError):
-                                    pass
-                            event_data.update({
-                                'crash_type': 'helicopter',
-                                'state': 'INITIAL',
-                                'location': location
-                            })
-                        elif event_type in ['airdrop_flying', 'airdrop_switched']:
-                            event_data.update({
-                                'airdrop_state': 'flying'
-                            })
-                        elif event_type in ['trader_spawn', 'trader_switched', 'trader_available']:
-                            location = 'Unknown'
-                            if len(match.groups()) >= 4 and match.group(2) and match.group(3):
-                                try:
-                                    x_coord = float(match.group(2))
-                                    y_coord = float(match.group(3))
-                                    location = f"Grid {x_coord:.0f},{y_coord:.0f}"
-                                except (ValueError, TypeError):
-                                    pass
-                            event_data.update({
-                                'trader_state': 'available',
-                                'location': location
-                            })
-                        elif event_type == 'construction_save' and len(match.groups()) >= 3:
-                            count = int(match.group(2))
-                            duration = float(match.group(3))
-                            event_data.update({
-                                'constructibles_count': count,
-                                'save_duration_ms': duration
-                            })
-                        elif event_type == 'server_max_players' and len(match.groups()) >= 2:
-                            event_data['max_players'] = int(match.group(2))
-                    except (ValueError, IndexError) as e:
-                        logger.debug(f"Error extracting data from event {event_type}: {e}")
+                    # Read new content from last position
+                    if last_position >= file_size:
+                        return  # No new content
 
-                    return event_data
+                    try:
+                        async with sftp.open(latest_log, 'r') as f:
+                            await f.seek(last_position)
+                            content = await f.read()
+                            new_position = await f.tell()
+                    except Exception as e:
+                        logger.error(f"Error reading log file {latest_log}: {e}")
+                        return
+
+                    if not content.strip():
+                        return
+
+                    # Handle potential binary content
+                    if isinstance(content, bytes):
+                        try:
+                            content = content.decode('utf-8')
+                        except UnicodeDecodeError:
+                            content = content.decode('latin-1')
+
+                    lines = [line.strip() for line in content.splitlines() if line.strip()]
+
+                    # Process lines in batches with async gather
+                    batch_size = 500
+                    for i in range(0, len(lines), batch_size):
+                        batch = lines[i:i + batch_size]
+
+                        # Parse batch concurrently
+                        parse_tasks = [self.parse_log_line(line, server_key, guild_id) for line in batch]
+                        results = await asyncio.gather(*parse_tasks, return_exceptions=True)
+
+                        # Process results
+                        for line, result in zip(batch, results):
+                            if isinstance(result, Exception):
+                                logger.error(f"Error parsing line: {result}")
+                                continue
+
+                            if result:  # Valid event data
+                                # Always process database events
+                                await self.process_log_event(guild_id, server_id, result)
+
+                                # Handle embeds based on fast_parse mode
+                                if self.fast_parse:
+                                    # Queue embed for later
+                                    self.embed_backlog.append((guild_id, server_id, result))
+                                else:
+                                    # Send embed immediately
+                                    if self.should_output_event(result['type'], result.get('data', {})):
+                                        await self.send_log_event_embed(guild_id, server_id, result)
+
+                    # Update position tracking
+                    self.last_log_position[server_key] = new_position
+                    await self._save_persistent_state()
 
                 except Exception as e:
-                    logger.debug(f"Failed to parse event type {event_type} from line: {e}")
-                    continue
+                    logger.error(f"Error processing SFTP logs: {e}")
 
-        # Log unmatched lines occasionally for debugging
-        if len(line) > 50:  # Only log substantial lines
-            logger.debug(f"No pattern matched for line: {line[:100]}...")
+        except Exception as e:
+            logger.error(f"Error in SFTP log parsing: {e}")
 
-        return None
+    async def parse_log_line(self, line: str, server_key: str, guild_id: int) -> Optional[Dict[str, Any]]:
+        """Parse a single log line and extract event data"""
+        try:
+            for event_type, pattern in self.log_patterns.items():
+                match = pattern.match(line)
+                if match:
+                    return await self.extract_event_data(event_type, match, server_key, guild_id)
+            return None
+        except Exception as e:
+            logger.error(f"Error parsing log line: {e}")
+            return None
 
-    def should_output_event(self, event_data: Dict[str, Any]) -> bool:
-        """Determine if event should be output based on dispatch rules"""
-        event_type = event_data['type']
+    async def extract_event_data(self, event_type: str, match, server_key: str, guild_id: int) -> Dict[str, Any]:
+        """Extract event data from regex match"""
+        try:
+            groups = match.groups()
+            timestamp_str = groups[0]
+            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
 
-        # Mission events - output only when READY
-        if event_type in ['mission_ready', 'mission_waiting', 'mission_initial']:
-            return event_type == 'mission_ready'
+            event_data = {
+                'type': event_type,
+                'timestamp': timestamp,
+                'raw_line': match.string,
+                'data': {}
+            }
 
-        # Airdrop events - output when flying or switched
-        if event_type in ['airdrop_flying', 'airdrop_switched']:
+            # Extract data based on event type
+            if event_type in ['player_world_joined', 'player_queue_left']:
+                event_data['data'] = {
+                    'player_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'connection_id': groups[2] if len(groups) > 2 else 'Unknown',
+                    'ip': groups[3] if len(groups) > 3 else 'Unknown',
+                    'port': groups[4] if len(groups) > 4 else 'Unknown'
+                }
+
+            elif event_type in ['player_world_connect', 'player_session_start']:
+                event_data['data'] = {
+                    'player_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'connection_id': groups[2] if len(groups) > 2 else 'Unknown'
+                }
+
+            elif event_type == 'player_world_spawn':
+                event_data['data'] = {
+                    'player_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'connection_id': groups[2] if len(groups) > 2 else 'Unknown',
+                    'x': float(groups[3]) if len(groups) > 3 else 0.0,
+                    'y': float(groups[4]) if len(groups) > 4 else 0.0,
+                    'location': f"({groups[3]}, {groups[4]})" if len(groups) > 4 else "(0, 0)"
+                }
+
+            elif event_type == 'player_online_status':
+                event_data['data'] = {
+                    'player_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'connection_id': groups[2] if len(groups) > 2 else 'Unknown',
+                    'status': groups[3] if len(groups) > 3 else 'Unknown'
+                }
+
+            elif event_type in ['mission_start']:
+                event_data['data'] = {
+                    'mission_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'x': float(groups[2]) if len(groups) > 2 else 0.0,
+                    'y': float(groups[3]) if len(groups) > 3 else 0.0,
+                    'location': f"({groups[2]}, {groups[3]})" if len(groups) > 3 else "(0, 0)"
+                }
+
+            elif event_type in ['mission_complete']:
+                event_data['data'] = {
+                    'mission_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'player_name': groups[2] if len(groups) > 2 else 'Unknown',
+                    'connection_id': groups[3] if len(groups) > 3 else 'Unknown'
+                }
+
+            elif event_type in ['mission_failed']:
+                event_data['data'] = {
+                    'mission_name': groups[1] if len(groups) > 1 else 'Unknown'
+                }
+
+            elif event_type in ['trader_spawn', 'vehicle_spawn', 'airdrop_spawn', 'helicrash_spawn']:
+                event_data['data'] = {
+                    'item_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'x': float(groups[2]) if len(groups) > 2 else 0.0,
+                    'y': float(groups[3]) if len(groups) > 3 else 0.0,
+                    'location': f"({groups[2]}, {groups[3]})" if len(groups) > 3 else "(0, 0)"
+                }
+
+            elif event_type in ['trader_switched']:
+                event_data['data'] = {
+                    'from_trader': groups[1] if len(groups) > 1 else 'Unknown',
+                    'to_trader': groups[2] if len(groups) > 2 else 'Unknown'
+                }
+
+            elif event_type in ['trader_available']:
+                event_data['data'] = {
+                    'trader_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'duration': groups[2] if len(groups) > 2 else 'Unknown'
+                }
+
+            elif event_type in ['vehicle_delete']:
+                event_data['data'] = {
+                    'vehicle_name': groups[1] if len(groups) > 1 else 'Unknown'
+                }
+
+            elif event_type in ['airdrop_looted', 'helicrash_looted']:
+                event_data['data'] = {
+                    'item_name': groups[1] if len(groups) > 1 else 'Unknown',
+                    'player_name': groups[2] if len(groups) > 2 else 'Unknown',
+                    'connection_id': groups[3] if len(groups) > 3 else 'Unknown'
+                }
+
+            return event_data
+
+        except Exception as e:
+            logger.error(f"Error extracting event data: {e}")
+            return None
+
+    def should_output_event(self, event_type: str, event_data: Dict[str, Any]) -> bool:
+        """Determine if an event should generate Discord output"""
+        # Mission events - always output significant missions
+        if event_type in ['mission_start', 'mission_complete', 'mission_failed']:
             return True
 
-        # Encounters - do not output
-        if event_type == 'encounter_initial':
-            return False
-
-        # Construction saves - do not output
-        if event_type == 'construction_save':
-            return False
-
-        # Heli crashes - output all types
-        if event_type in ['helicrash_initial', 'helicrash_spawned', 'helicrash_switched']:
-            return True
-
-        # Trader events - output all types
+        # Trader events - output trader spawns and availability
         if event_type in ['trader_spawn', 'trader_switched', 'trader_available']:
             return True
 
@@ -1104,543 +531,141 @@ class LogParser:
 
         # Player events - output based on significance (connections and disconnections)
         if event_type in ['player_world_connect', 'player_world_spawn', 'player_online_status', 'player_session_start',
-                         'player_queue_disconnect', 'player_disconnect_cleanup', 'player_session_end', 
-                         'player_beacon_disconnect', 'player_network_disconnect', 'player_accepted_from', 
-                         'player_connection_cleanup', 'player_beacon_join']:
+                          'player_world_joined', 'player_queue_left']:
             return True
 
-        # Queue events - output for visibility into queue activity
-        if event_type in ['player_queue_accepted', 'player_queue_timeout', 'player_queue_failed', 'player_auth_failed']:
+        # Airdrop and helicrash events
+        if event_type in ['airdrop_spawn', 'airdrop_looted', 'helicrash_spawn', 'helicrash_looted']:
             return True
 
         return False
 
-    async def send_log_event_embed(self, guild_id: int, server_id: str, event_data: Dict[str, Any]):
-        """Send log event embed to appropriate channel using EmbedFactory"""
+    async def process_log_event(self, guild_id: int, server_id: str, event_data: Dict[str, Any]):
+        """Process log event for database storage and player tracking"""
         try:
-            # Check if event should be output
-            if not self.should_output_event(event_data):
-                logger.debug(f"Event {event_data['type']} suppressed per dispatch rules")
+            event_type = event_data['type']
+            data = event_data['data']
+            timestamp = event_data['timestamp']
+
+            # Player connection tracking
+            if event_type == 'player_world_joined':
+                connection_id = data.get('connection_id')
+                if connection_id:
+                    self.player_connections[connection_id] = {
+                        'player_name': data.get('player_name'),
+                        'guild_id': guild_id,
+                        'server_id': server_id,
+                        'connected_at': timestamp,
+                        'ip': data.get('ip'),
+                        'port': data.get('port')
+                    }
+
+            elif event_type == 'player_queue_left':
+                connection_id = data.get('connection_id')
+                if connection_id in self.player_connections:
+                    connection_info = self.player_connections[connection_id]
+                    session_duration = timestamp - connection_info['connected_at']
+
+                    # Store session data
+                    session_key = f"{guild_id}_{server_id}_{connection_id}_{timestamp.isoformat()}"
+                    self.player_sessions[session_key] = {
+                        'player_name': connection_info['player_name'],
+                        'guild_id': guild_id,
+                        'server_id': server_id,
+                        'connected_at': connection_info['connected_at'],
+                        'disconnected_at': timestamp,
+                        'duration': session_duration.total_seconds(),
+                        'ip': connection_info['ip']
+                    }
+
+                    # Clean up connection tracking
+                    del self.player_connections[connection_id]
+
+            # Store event in database
+            if hasattr(self.bot, 'db_manager') and self.bot.db_manager:
+                await self.bot.db_manager.store_log_event(guild_id, server_id, event_data)
+
+        except Exception as e:
+            logger.error(f"Error processing log event: {e}")
+
+    async def send_log_event_embed(self, guild_id: int, server_id: str, event_data: Dict[str, Any]):
+        """Send Discord embed for log event"""
+        try:
+            # Skip if fast parse mode is enabled
+            if self.fast_parse:
                 return
 
-            # Get guild configuration - FIX: Use proper database manager
-            if not hasattr(self.bot, 'db_manager') or not self.bot.db_manager:
-                logger.warning("Bot database not available for sending embeds")
+            event_type = event_data['type']
+
+            # Check if event should generate output
+            if not self.should_output_event(event_type, event_data.get('data', {})):
                 return
 
+            # Get guild and channel configuration
             guild_config = await self.bot.db_manager.get_guild(guild_id)
             if not guild_config:
                 return
 
             channels = guild_config.get('channels', {})
-            event_type = event_data['type']
 
-            # Map event types to channel types
-            channel_mapping = {
-                # Player connection events
-                'player_world_connect': 'connections',
-                'player_world_spawn': 'connections', 
-                'player_online_status': 'connections',
-                'player_session_start': 'connections',
-                'player_queue_accepted': 'connections',
-                'player_accepted_from': 'connections',
-                'player_beacon_join': 'connections',
-                # Player disconnection events
-                'player_queue_disconnect': 'connections',
-                'player_disconnect_cleanup': 'connections',
-                'player_session_end': 'connections',
-                'player_beacon_disconnect': 'connections',
-                'player_network_disconnect': 'connections',
-                'player_connection_cleanup': 'connections',
-                'player_queue_timeout': 'connections',
-                'player_queue_failed': 'connections',
-                'player_auth_failed': 'connections',
-                # Game events
-                'mission_ready': 'events',
-                'airdrop_flying': 'events',
-                'airdrop_switched': 'events',
-                'helicrash_initial': 'events',
-                'helicrash_spawned': 'events',
-                'helicrash_switched': 'events',
-                'trader_spawn': 'events',
-                'trader_switched': 'events',
-                'trader_available': 'events',
-                'vehicle_spawn': 'events',
-                'vehicle_delete': 'events'
-            }
-
-            # Get the appropriate channel for this event type
-            channel_type = channel_mapping.get(event_type, 'events')  # Default to events
-            channel_id = channels.get(channel_type)
-
-            # If specific channel not set, try fallback channels
-            if not channel_id:
-                # Try 'logs' as fallback for backward compatibility
-                channel_id = channels.get('logs')
-
-            if not channel_id:
-                logger.debug(f"No channel configured for event type '{event_type}' (needs '{channel_type}' channel)")
-                return
-
-            channel = self.bot.get_channel(channel_id)
-            if not channel:
-                logger.warning(f"Channel {channel_id} not found for event type '{event_type}'")
-                return
-
-            # Create event-specific embed using EmbedFactory with file attachment
-            embed_result = await self._create_event_embed_via_factory(event_data)
-            if embed_result:
-                if isinstance(embed_result, tuple):
-                    embed, file = embed_result
-                    await channel.send(embed=embed, file=file)
-                else:
-                    embed = embed_result
-                    await channel.send(embed=embed)
-                logger.debug(f"Sent {event_type} embed to {channel_type} channel: {channel.name}")
-
-        except Exception as e:
-            logger.error(f"Failed to send log event embed: {e}")
-
-    async def _create_event_embed_via_factory(self, event_data: Dict[str, Any]):
-        """Create styled embed for log event using EmbedFactory"""
-        try:
+            # Import EmbedFactory dynamically to avoid circular imports
             from bot.utils.embed_factory import EmbedFactory
 
-            event_type = event_data['type']
-            timestamp = event_data['timestamp']
+            # Determine target channel and build embed
+            channel_id = None
+            embed = None
+            file = None
 
-            # Map event types to EmbedFactory keys and create appropriate embeds
-            if event_type == 'player_world_connect':
-                embed_data = {
-                    'connection_id': event_data.get('connection_id', 'Unknown'),
-                    'server_id': event_data.get('server_id', 'Unknown'),
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('player_connection', embed_data)
+            embed_data = {
+                'timestamp': event_data['timestamp'],
+                'server_id': server_id
+            }
+            embed_data.update(event_data.get('data', {}))
 
-            elif event_type == 'player_queue_disconnect':
-                embed_data = {
-                    'connection_id': event_data.get('connection_id', 'Unknown'),
-                    'server_id': event_data.get('server_id', 'Unknown'),
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('player_disconnection', embed_data)
+            if event_type in ['player_world_joined']:
+                channel_id = channels.get('connections')
+                embed, file = await EmbedFactory.build('player_connection', embed_data)
 
-            elif event_type == 'mission_ready':
-                mission_name = event_data.get('normalized_name', 'Unknown Mission')
-                embed_data = {
-                    'mission_name': mission_name,
-                    'state': 'READY',
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('mission_event', embed_data)
+            elif event_type in ['player_queue_left']:
+                channel_id = channels.get('disconnections')
+                embed, file = await EmbedFactory.build('player_disconnection', embed_data)
 
-            elif event_type in ['airdrop_flying', 'airdrop_switched']:
-                embed_data = {
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('airdrop_event', embed_data)
+            elif event_type in ['mission_start']:
+                channel_id = channels.get('missions')
+                embed, file = await EmbedFactory.build('mission_start', embed_data)
 
-            elif event_type in ['helicrash_initial', 'helicrash_spawned', 'helicrash_switched']:
-                embed_data = {
-                    'location': event_data.get('location', 'Unknown'),
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('helicrash_event', embed_data)
+            elif event_type in ['mission_complete']:
+                channel_id = channels.get('missions')
+                embed, file = await EmbedFactory.build('mission_complete', embed_data)
 
-            elif event_type in ['trader_spawn', 'trader_switched', 'trader_available']:
-                embed_data = {
-                    'location': event_data.get('location', 'Unknown'),
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('trader_event', embed_data)
+            elif event_type in ['trader_spawn']:
+                channel_id = channels.get('traders')
+                embed, file = await EmbedFactory.build('trader_spawn', embed_data)
 
-            elif event_type == 'vehicle_spawn':
-                vehicle_type = event_data.get('vehicle_type', 'Military Vehicle')
-                embed_data = {
-                    'vehicle_type': vehicle_type,
-                    'action': 'spawn',
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('vehicle_event', embed_data)
+            elif event_type in ['airdrop_spawn']:
+                channel_id = channels.get('airdrops')
+                embed, file = await EmbedFactory.build('airdrop_spawn', embed_data)
 
-            elif event_type == 'vehicle_delete':
-                vehicle_type = event_data.get('vehicle_type', 'Military Vehicle')
-                embed_data = {
-                    'vehicle_type': vehicle_type,
-                    'action': 'delete',
-                    'timestamp': timestamp
-                }
-                return await EmbedFactory.build('vehicle_event', embed_data)
+            elif event_type in ['helicrash_spawn']:
+                channel_id = channels.get('helicrashes')
+                embed, file = await EmbedFactory.build('helicrash_spawn', embed_data)
 
-            else:
-                return None
+            # Send embed if we have a valid channel and embed
+            if channel_id and embed:
+                try:
+                    guild = self.bot.get_guild(guild_id)
+                    if guild:
+                        channel = guild.get_channel(channel_id)
+                        if channel:
+                            if file:
+                                await channel.send(embed=embed, file=file)
+                            else:
+                                await channel.send(embed=embed)
+                except Exception as e:
+                    logger.error(f"Error sending embed to channel {channel_id}: {e}")
 
         except Exception as e:
-            logger.error(f"Failed to create event embed via factory: {e}")
-            return None
-
-    async def parse_logs_for_server(self, guild_id: int, server_config: Dict[str, Any]):
-        """Parse logs for a specific server"""
-        try:
-            # Check if server has premium access - for now, allow all servers to use log parser
-            # Premium check can be re-enabled later if needed
-            # if not await self.bot.database.is_premium_server(guild_id, str(server_config.get('_id', 'unknown'))):
-            #     return
-
-            # Parse logs using SSH/SFTP
-            if self.bot.dev_mode:
-                await self.parse_dev_logs(guild_id, server_config)
-            else:
-                await self.parse_sftp_logs(guild_id, server_config)
-
-        except Exception as e:
-            logger.error(f"Failed to parse logs for server {server_config}: {e}")
-
-    async def parse_sftp_logs(self, guild_id: int, server_config: Dict[str, Any]):
-        """Parse logs from SFTP server"""
-        try:
-            host = server_config.get('host', server_config.get('hostname'))
-            port = server_config.get('port', 22)
-            username = server_config.get('username')
-            password = server_config.get('password')
-            server_id = str(server_config.get('_id', 'unknown'))
-
-            if not all([host, username, password]):
-                logger.warning(f"Missing SFTP credentials for server {server_id}")
-                return
-
-            # Create SSH connection
-            async with asyncssh.connect(
-                host, port=port, username=username, password=password,
-                known_hosts=None, server_host_key_algs=['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512']
-            ) as conn:
-
-                async with conn.start_sftp_client() as sftp:
-                    # Get log files
-                    log_path = f"./{host}_{server_id}/actual1/logs/"
-
-                    try:
-                        files = await sftp.glob(f"{log_path}**/*.log")
-
-                        # Get current time with timezone awareness
-                        current_time = datetime.now(timezone.utc)
-
-                        for file_path in files:
-                            try:
-                                # Check file modification time
-                                stat = await sftp.stat(file_path)
-                                # Make file_mtime timezone-aware
-                                file_mtime = datetime.fromtimestamp(getattr(stat, 'st_mtime', datetime.now().timestamp()), tz=timezone.utc)
-
-                                # Only process recent files (last 24 hours)
-                                if (current_time - file_mtime).total_seconds() > 86400:
-                                    continue
-
-                                # Read and parse file
-                                async with sftp.open(file_path, 'r') as f:
-                                    content = await f.read()
-                                    await self.process_log_content(guild_id, server_id, content)
-
-                            except Exception as e:
-                                logger.error(f"Failed to process log file {file_path}: {e}")
-                                continue
-
-                    except Exception as e:
-                        logger.warning(f"No log files found at {log_path}: {e}")
-
-        except Exception as e:
-            logger.error(f"Failed SFTP log parsing: {e}")
-
-    async def parse_dev_logs(self, guild_id: int, server_config: Dict[str, Any]):
-        """Parse logs in development mode from local files"""
-        try:
-            server_id = str(server_config.get('_id', 'dev_server'))
-
-            # Get log content from dev files
-            log_content = await self.get_dev_log_content()
-
-            if not log_content:
-                logger.warning(f"No dev log content found for server {server_id}")
-                return
-
-            lines = log_content.splitlines()
-            total_lines = len(lines)
-
-            # Track position for incremental parsing using persistent state
-            server_key = f"{guild_id}_{server_id}"
-            
-            # Check if file has been reset using persistent tracking
-            file_size = len(log_content.encode('utf-8'))  # Estimate file size
-            file_was_reset = self._detect_file_reset(server_key, file_size, lines)
-            
-            if file_was_reset:
-                logger.info(f"Dev file reset detected for {server_key}, starting from beginning")
-                last_position = 0
-            else:
-                # Get last processed line count from persistent state
-                stored_state = self.file_states.get(server_key, {})
-                last_position = stored_state.get('line_count', 0)
-                
-                # Validate that our stored position is still valid
-                if last_position > total_lines:
-                    logger.warning(f"Stored position {last_position} exceeds file size {total_lines}, resetting")
-                    last_position = 0
-
-            # Process new lines only
-            new_lines = lines[last_position:]
-            new_events = 0
-
-            for line in new_lines:
-                status_server_key = self.get_server_status_key(guild_id, server_id)
-                event_data = await self.parse_log_line(line, status_server_key, guild_id)
-                if event_data:
-                    # Process player tracking events
-                    await self.process_log_event(guild_id, server_id, event_data)
-                    # Send embed
-                    await self.send_log_event_embed(guild_id, server_id, event_data)
-                    new_events += 1
-
-            # Update file state with current information
-            if lines:
-                last_line_content = lines[-1] if lines else ""
-                await self._update_file_state(server_key, file_size, total_lines, last_line_content)
-
-            # Update legacy position tracking for compatibility
-            self.last_log_position[server_key] = total_lines
-
-            if new_events > 0:
-                logger.info(f"Processed {new_events} new dev log events for server {server_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to parse dev logs for server {server_config}: {e}")
-
-    async def parse_server_logs(self, guild_id: int, server_config: Dict[str, Any]):
-        """Parse logs for a single server (PREMIUM ONLY) with enhanced event detection"""
-        try:
-            server_id = str(server_config.get('_id', 'unknown'))
-
-            logger.info(f"Parsing logs for premium server {server_id} in guild {guild_id}")
-
-            # Get log content
-            if self.bot.dev_mode:
-                log_content = await self.get_dev_log_content()
-            else:
-                log_content = await self.get_sftp_log_content(server_config)
-
-            if not log_content:
-                logger.warning(f"No log content found for server {server_id}")
-                return
-
-            if not log_content.strip():
-                logger.warning(f"Log content is empty for server {server_id}")
-                return
-
-            lines = log_content.splitlines()
-            logger.info(f"Processing {len(lines)} new lines from log content")
-
-            # Process in larger batches for better performance with 100+ servers
-            batch_size = 500
-            new_events = 0
-            processed_lines = 0
-            total_batches = (len(lines) + batch_size - 1) // batch_size
-
-            logger.info(f"Starting enhanced batch processing: {len(lines)} lines in {total_batches} batches")
-
-            for i in range(0, len(lines), batch_size):
-                batch = lines[i:i + batch_size]
-                batch_events = 0
-                batch_number = (i // batch_size) + 1
-
-                logger.debug(f"Processing batch {batch_number}/{total_batches} (lines {i+1}-{min(i+batch_size, len(lines))})")
-
-                for line_num, line in enumerate(batch, start=i+1):
-                    processed_lines += 1
-                    server_key = self.get_server_status_key(guild_id, server_id)
-                    event_data = await self.parse_log_line(line, server_key, guild_id)
-                    if event_data:
-                        logger.debug(f"Line {line_num}: Parsed event: {event_data['type']}")
-                        # Process player tracking events
-                        await self.process_log_event(guild_id, server_id, event_data)
-                        # Send embed (with dispatch rule filtering)
-                        await self.send_log_event_embed(guild_id, server_id, event_data)
-                        new_events += 1
-                        batch_events += 1
-
-                # Log progress for every batch
-                logger.info(f"Batch {batch_number}/{total_batches}: Found {batch_events} events from {len(batch)} lines (total processed: {processed_lines}/{len(lines)})")
-
-                # Small delay between batches to prevent overwhelming Discord API
-                if i + batch_size < len(lines):
-                    await asyncio.sleep(0.05)
-
-            logger.info(f"Completed enhanced processing {processed_lines} lines, found {new_events} events for server {server_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to parse logs for server {server_config}: {e}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-
-    async def run_log_parser(self):
-        """Run log parser for all premium servers"""
-        try:
-            logger.info("Running enhanced log parser for premium servers...")
-
-            # Get all guilds with configured servers
-            guilds_cursor = self.bot.database.guilds.find({})
-
-            async for guild_doc in guilds_cursor:
-                guild_id = guild_doc['guild_id']
-                servers = guild_doc.get('servers', [])
-
-                for server_config in servers:
-                    await self.parse_server_logs(guild_id, server_config)
-
-            logger.info("Enhanced log parser completed")
-
-        except Exception as e:
-            logger.error(f"Failed to run enhanced log parser: {e}")
-
-    async def process_log_content(self, guild_id: int, server_id: str, content: str):
-        """Process log content and extract events"""
-        try:
-            lines = content.splitlines()
-            for line in lines:
-                if not line.strip():
-                    continue
-
-                server_key = self.get_server_status_key(guild_id, server_id)
-                event_data = await self.parse_log_line(line, server_key, guild_id)
-                if event_data:
-                    # Process player tracking events
-                    await self.process_log_event(guild_id, server_id, event_data)
-                    # Send embed
-                    await self.send_log_event_embed(guild_id, server_id, event_data)
-
-        except Exception as e:
-            logger.error(f"Failed to process log content: {e}")
-
-    def schedule_log_parser(self):
-        """Schedule log parser to run every 300 seconds"""
-        try:
-            self.bot.scheduler.add_job(
-                self.run_log_parser,
-                'interval',
-                seconds=300,  # 5 minutes
-                id='log_parser',
-                replace_existing=True
-            )
-            logger.info("Enhanced log parser scheduled (every 300 seconds)")
-
-        except Exception as e:
-            logger.error(f"Failed to schedule enhanced log parser: {e}")
-
-    async def process_log_event(self, guild_id: int, server_id: str, event_data: Dict[str, Any]):
-        """Process a parsed log event, handling comprehensive player lifecycle tracking"""
-        try:
-            event_type = event_data['type']
-            timestamp = event_data['timestamp']
-
-            # Handle comprehensive player lifecycle tracking
-            if event_type in ['player_queue_request', 'player_queue_accepted', 'player_beacon_handshake', 
-                            'player_beacon_auth', 'player_world_auth', 'player_world_spawn', 
-                            'player_online_status', 'player_session_start', 'player_character_spawn',
-                            'player_disconnect_cleanup', 'player_session_end', 'player_beacon_disconnect',
-                            'player_network_disconnect', 'player_queue_timeout', 'player_queue_failed',
-                            'player_auth_failed', 'player_queue_join', 'player_beacon_connected',
-                            'player_world_connect', 'player_queue_disconnect']:
-                
-                ip = event_data.get('ip')
-                port = event_data.get('port')
-                
-                if ip and port:
-                    additional_data = {}
-                    if 'unique_id' in event_data:
-                        additional_data['unique_id'] = event_data['unique_id']
-                    
-                    await self.track_player_lifecycle_event(
-                        guild_id, server_id, ip, port, event_type, timestamp, additional_data
-                    )
-                    
-            elif event_type == 'server_max_players':
-                max_players = event_data.get('max_players', 50)
-                await self.update_server_max_players(guild_id, server_id, max_players)
-
-            # Periodic cleanup of old lifecycle data
-            if hasattr(self, '_last_cleanup'):
-                if (timestamp - self._last_cleanup).total_seconds() > 3600:  # Cleanup every hour
-                    await self.cleanup_old_lifecycle_data()
-                    self._last_cleanup = timestamp
-            else:
-                self._last_cleanup = timestamp
-
-        except Exception as e:
-            logger.error(f"Failed to process log event: {e}")
-
-    async def _load_persistent_state(self):
-        """Load persistent file state from disk"""
-        try:
-            if self.file_state_path.exists():
-                async with aiofiles.open(self.file_state_path, 'r') as f:
-                    content = await f.read()
-                    self.file_states = json.loads(content) if content.strip() else {}
-                    logger.info(f"Loaded persistent state for {len(self.file_states)} servers")
-            else:
-                self.file_states = {}
-                logger.info("No persistent state file found, starting fresh")
-        except Exception as e:
-            logger.error(f"Failed to load persistent state: {e}")
-            self.file_states = {}
-
-    async def _save_persistent_state(self):
-        """Save persistent file state to disk"""
-        try:
-            async with aiofiles.open(self.file_state_path, 'w') as f:
-                await f.write(json.dumps(self.file_states, indent=2))
-            logger.debug("Saved persistent state to disk")
-        except Exception as e:
-            logger.error(f"Failed to save persistent state: {e}")
-
-    async def _update_file_state(self, server_key: str, file_size: int, line_count: int, last_line_content: str):
-        """Update file state tracking"""
-        self.file_states[server_key] = {
-            'file_size': file_size,
-            'line_count': line_count,
-            'last_line': last_line_content,
-            'last_updated': datetime.now(timezone.utc).isoformat()
-        }
-        # Save state periodically (every 10 updates to avoid excessive I/O)
-        if len(self.file_states) % 10 == 0:
-            await self._save_persistent_state()
-
-    def _detect_file_reset(self, server_key: str, current_size: int, current_lines: List[str]) -> bool:
-        """Detect if file has been reset/rotated based on size and content"""
-        if server_key not in self.file_states:
-            return False
-            
-        stored_state = self.file_states[server_key]
-        stored_size = stored_state.get('file_size', 0)
-        stored_line_count = stored_state.get('line_count', 0)
-        stored_last_line = stored_state.get('last_line', '')
-        
-        # If file is significantly smaller, it's likely been reset
-        if current_size < stored_size * 0.5:  # 50% smaller indicates rotation
-            logger.info(f"File reset detected for {server_key}: size {stored_size} -> {current_size}")
-            return True
-            
-        # If we have fewer lines than expected, it's been reset
-        current_line_count = len(current_lines)
-        if current_line_count < stored_line_count * 0.5:  # 50% fewer lines
-            logger.info(f"File reset detected for {server_key}: lines {stored_line_count} -> {current_line_count}")
-            return True
-            
-        # If the last line we remember isn't in the current file, it's been reset
-        if stored_last_line and current_lines:
-            if stored_last_line not in current_lines[-min(10, len(current_lines)):]:  # Check last 10 lines
-                logger.info(f"File reset detected for {server_key}: last line not found")
-                return True
-                
-        return False
+            logger.error(f"Error sending log event embed: {e}")
 
     def reset_log_positions(self, guild_id: int = None, server_id: str = None):
         """Reset log position tracking for specific server or all servers"""
@@ -1657,12 +682,12 @@ class LogParser:
             self.last_log_position.clear()
             self.file_states.clear()
             logger.info("Reset all log position tracking and file states")
-        
+
         # Save state after reset
         asyncio.create_task(self._save_persistent_state())
 
     async def run_log_parser(self):
-        """Main log parser execution with enhanced event detection"""
+        """Main log parser execution with enhanced concurrency control"""
         try:
             logger.info("Starting enhanced log parser execution")
 
@@ -1674,50 +699,37 @@ class LogParser:
             guilds_cursor = self.bot.db_manager.guilds.find({})
             total_servers_processed = 0
 
+            # Process all guilds
             async for guild_doc in guilds_cursor:
                 guild_id = guild_doc['guild_id']
                 servers = guild_doc.get('servers', [])
+
                 if not servers:
-                    logger.warning(f"No servers found for guild {guild_id}")
                     continue
-                logger.info(f"Found {len(servers)} servers for guild {guild_id}")
 
-                for server in servers:
-                    server_name = server.get('name', 'Unknown')
-                    server_id = str(server.get('_id', 'unknown'))
-                    try:
-                        logger.info(f"Processing logs for server: {server_name} (ID: {server_id})")
+                # Create tasks for all servers in this guild
+                server_tasks = []
+                for server_config in servers:
+                    task = self.parse_server_logs(guild_id, server_config)
+                    server_tasks.append(task)
 
-                        await self.parse_server_logs(guild_id, server)
+                # Process servers concurrently with semaphore control
+                if server_tasks:
+                    await asyncio.gather(*server_tasks, return_exceptions=True)
+                    total_servers_processed += len(server_tasks)
 
-                        total_servers_processed += 1
-                        logger.info(f"Successfully processed logs for server: {server_name}")
+            logger.info(f"Enhanced log parser completed - processed {total_servers_processed} servers")
 
-                    except Exception as server_error:
-                        logger.error(f"Failed to process server {server_name}: {server_error}")
-                        import traceback
-                        logger.error(f"Server error traceback: {traceback.format_exc()}")
-
-            # Save persistent state after processing all servers
-            await self._save_persistent_state()
-            
-            logger.info(f"Enhanced log parser execution completed - processed {total_servers_processed} servers")
+            # If fast parse was enabled and we have backlog, consider flushing
+            if self.fast_parse and self.embed_backlog:
+                logger.info(f"Fast parse mode active with {len(self.embed_backlog)} queued embeds")
+                await self._flush_embed_backlog()
 
         except Exception as e:
-            logger.error(f"Enhanced log parser execution failed: {e}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Failed to run enhanced log parser: {e}")
         finally:
             # Ensure state is saved even if there's an error
             try:
                 await self._save_persistent_state()
             except Exception as save_error:
                 logger.error(f"Failed to save state during cleanup: {save_error}")
-
-    async def shutdown(self):
-        """Graceful shutdown - save persistent state"""
-        try:
-            await self._save_persistent_state()
-            logger.info("Log parser shutdown complete - state saved")
-        except Exception as e:
-            logger.error(f"Error during log parser shutdown: {e}")
