@@ -1,0 +1,136 @@
+PLAYER CONNECTION + COUNT SYSTEM REBUILD (NO PHASE 0)
+
+🧩 TASK TYPE: SINGLE TASK (NO INTERRUPTIONS)
+
+> You will perform a complete rebuild of the connection lifecycle parser and player count logic using the log line examples and lifecycle mapping provided below.
+This is one atomic task — Do not checkpoint, commit, or output until the entire parsing system is fixed, validated, and producing correct Discord output.
+
+
+
+
+---
+
+🎯 OBJECTIVE
+
+Revamp the Deadside.log parser to support a complete and accurate model of player connection lifecycles, including queue joins, actual joins, disconnections, and premature exits — and to track player and queue counts reliably.
+
+
+---
+
+🧠 EVENT DEFINITIONS (Regex-Required Matches)
+
+1. Queue Join (jq)
+
+Detect queue entries using lines containing:
+
+LogNet: Join request: /Game/Maps/world_0/World_0?...?Name={username}
+
+Extract: player_id → From platformid=PS5:{ID} or eosid=|{ID}
+
+Mark this as: jq (queued)
+
+
+2. Player Joined (j2)
+
+Detect when a player officially connects:
+
+LogOnline: Warning: Player |{player_id} successfully registered!
+
+Extract: player_id from |{id} pattern
+
+Mark this as: j2 (joined)
+
+
+3. Disconnect (Post Join — d1)
+
+Detect standard disconnections:
+
+UChannel::Close: Sending CloseBunch... UniqueId: EOS:|{player_id}
+
+Extract: player_id from UniqueId: EOS:|{id}
+
+If player already has a j2, mark as d1 (post-join disconnect)
+
+
+4. Disconnect (Pre-Join — d2)
+
+If a player has jq but no j2 before UChannel::Close → mark as d2 (disconnect from queue)
+
+
+
+---
+
+🔢 LIVE COUNT CALCULATIONS (For voice channel display)
+
+Metric	Formula
+
+Queue Count (QC)	jq - j2 - d2
+Player Count (PC)	j2 - d1
+
+
+Counts must update in real time as events are parsed. These counts must be surfaced via:
+
+Voice channel renaming (Players: {PC} / Queue: {QC})
+
+Optional embed log events (see below)
+
+
+
+---
+
+🎨 EMBED EVENT OUTPUT RULES
+
+Event	Embed Output	EmbedFactory Key
+
+j2 Join	Yes (Themed Embed)	player_join
+d1 Leave	Yes (Themed Embed)	player_leave
+jq, d2	No output	N/A
+
+
+Embed format must match standard Killfeed rules:
+
+Created with EmbedFactory.build()
+
+Right-aligned thumbnail
+
+Themed color bar (#2980B9 for joins, #8E44AD for disconnects)
+
+Randomized message body per event
+
+Accurate player name or ID
+
+Footer: Powered by Discord.gg/EmeraldServers
+
+Timestamp: actual event time, not generation time
+
+
+
+---
+
+✅ COMPLETION CRITERIA
+
+[ ] All 4 lifecycle events detected correctly using robust regex
+
+[ ] Player counts and queue counts are 100% accurate
+
+[ ] Voice channels reflect current PC and QC values
+
+[ ] All embed output rules followed using EmbedFactory
+
+[ ] No false positives or missed player events
+
+[ ] Parser correctly ignores malformed or unrelated lines
+
+
+
+---
+
+🚨 EXECUTION RULES
+
+This is one atomic task
+
+No commits, logs, or checkpoints until the entire player lifecycle system is fully implemented and live-verified
+
+py-cord 2.6.1 must be used — discord.py is not permitted
+
+Replit Assistant must execute all regex and logic changes in one uninterrupted batch
