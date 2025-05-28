@@ -241,15 +241,18 @@ class LogParser:
                             '3des-cbc', 'blowfish-cbc',
                             'arcfour256', 'arcfour128', 'arcfour'
                         ],
-                        # Comprehensive MAC algorithms
+                        # Comprehensive MAC algorithms - prioritize legacy algorithms
                         'mac_algs': [
+                            'hmac-ripemd160-etm@openssh.com',  # Legacy algorithm first
+                            'hmac-ripemd160@openssh.com',      # Alternative format
+                            'hmac-ripemd160',
+                            'hmac-md5-etm@openssh.com',
+                            'hmac-md5',
+                            'hmac-sha1-etm@openssh.com',
+                            'hmac-sha1',
                             'hmac-sha2-256-etm@openssh.com',
                             'hmac-sha2-512-etm@openssh.com',
-                            'hmac-sha2-256', 'hmac-sha2-512',
-                            'hmac-sha1-etm@openssh.com',
-                            'hmac-sha1', 'hmac-md5-etm@openssh.com',
-                            'hmac-md5', 'hmac-ripemd160-etm@openssh.com',
-                            'hmac-ripemd160'
+                            'hmac-sha2-256', 'hmac-sha2-512'
                         ],
                         # Server host key algorithms
                         'server_host_key_algs': [
